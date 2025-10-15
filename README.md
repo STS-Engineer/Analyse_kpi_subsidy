@@ -1,10 +1,6 @@
 #API Endpoints
 
-
-
-GET / - API documentation and available endpoints
-
-KPI Endpoints
+##KPI Endpoints
 
 GET /api/kpis/global - Global KPIs across all sites
 
@@ -14,7 +10,7 @@ GET /api/kpis/by-project - KPIs grouped by project
 
 GET /api/kpis/all - All KPIs (global, by-site, by-project)
 
-Data Endpoints
+##Data Endpoints
 
 GET /api/data/requests - All subsidy requests data
 
