@@ -1,5 +1,4 @@
 API Endpoints
-Home
 
 GET / - API documentation and available endpoints
 
