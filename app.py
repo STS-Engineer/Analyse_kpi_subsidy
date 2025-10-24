@@ -1,30 +1,43 @@
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from flask_cors import CORS
+import os
 import psycopg2
 import pandas as pd
 from typing import Dict, List
 from datetime import date, datetime
 import json
 
+# ============================================================================
+# Flask & CORS
+# ============================================================================
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
+# ============================================================================
+# DB CONFIG (use env vars for safety)
+#   export PGHOST=...
+#   export PGDATABASE=...
+#   export PGUSER=...
+#   export PGPASSWORD=...
+# ============================================================================
 DB_CONFIG = {
-    "host": "avo-adb-002.postgres.database.azure.com",
-    "database": "Subsidy_DB",
-    "user": "administrationSTS",
-    "password": "St$@0987"
+    "host": os.getenv("PGHOST", "avo-adb-002.postgres.database.azure.com"),
+    "database": os.getenv("PGDATABASE", "Subsidy_DB"),
+    "user": os.getenv("PGUSER", "administrationSTS"),
+    "password": os.getenv("PGPASSWORD", "St$@0987"),
+    "sslmode": os.getenv("PGSSLMODE", "require")
 }
 
+# ============================================================================
+# Helpers
+# ============================================================================
 class DateTimeEncoder(json.JSONEncoder):
-    """Custom JSON encoder for datetime objects."""
     def default(self, obj):
         if isinstance(obj, (date, datetime)):
             return obj.isoformat()
         return super().default(obj)
 
 def get_db_connection():
-    """Create and return a database connection."""
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         return conn
@@ -32,7 +45,6 @@ def get_db_connection():
         raise Exception(f"Database connection error: {e}")
 
 def get_subsidy_requests_data(connection) -> pd.DataFrame:
-    """Retrieve relevant columns from subsidy_requests table for KPIs."""
     query = """
     SELECT 
         id,
@@ -48,11 +60,9 @@ def get_subsidy_requests_data(connection) -> pd.DataFrame:
         date_of_subsidy_receipt
     FROM public.subsidy_requests
     """
-    df = pd.read_sql_query(query, connection)
-    return df
+    return pd.read_sql_query(query, connection)
 
 def get_action_plan_data(connection) -> pd.DataFrame:
-    """Retrieve relevant columns from subsidy_action_plan table for KPIs."""
     query = """
     SELECT 
         id,
@@ -67,148 +77,214 @@ def get_action_plan_data(connection) -> pd.DataFrame:
         expected_gain
     FROM public.subsidy_action_plan
     """
-    df = pd.read_sql_query(query, connection)
-    return df
+    return pd.read_sql_query(query, connection)
 
+# --- Small utility to be robust to casing/spacing in text columns
+def _clean_text(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip()
+
+# ============================================================================
+# KPI Calculations
+#   Your KPIs added:
+#   - plant_requests: request_type == 'Planned requests'
+#   - success_rate_validated: Won among validated (%)
+#   - percent_positive_answers: Validated among submitted (%)
+#   - impact_competitiveness: sum(amount_awarded)/sum(estimated_budget) (%)
+# ============================================================================
 def calculate_global_kpis(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict:
-    """Calculate global KPIs (all sites combined)."""
+    df = subsidy_requests.copy()
+    ap = action_plan.copy()
+
+    # Normalize columns
+    df['estimated_budget'] = pd.to_numeric(df['estimated_budget'], errors='coerce').fillna(0)
+    df['amount_awarded']  = pd.to_numeric(df['amount_awarded'],  errors='coerce').fillna(0)
+
+    # Clean text columns (be tolerant to case/whitespace)
+    for col in ['request_type', 'decision', 'subsidy_outcome', 'site_location']:
+        if col in df.columns:
+            df[col] = _clean_text(df[col])
+
+    # Masks & base sets
+    total_requests = len(df)
+    spontaneous_mask = df['request_type'].eq('Spontaneous requests')
+    planned_mask     = df['request_type'].eq('Planned requests')          # <-- Plant Requests (your spec)
+    validated_mask   = df['decision'].isin(['Validate all subventions', 'Validate some subventions'])
+    any_answer_mask  = df['decision'].notna()
+    won_mask         = df['subsidy_outcome'].eq('Won')
+    in_progress_mask = df['decision'].isna()
+
+    # Core/global KPIs you already had
     kpis = {}
-    
-    # Convert numeric columns to proper types
-    subsidy_requests['estimated_budget'] = pd.to_numeric(subsidy_requests['estimated_budget'], errors='coerce').fillna(0)
-    subsidy_requests['amount_awarded'] = pd.to_numeric(subsidy_requests['amount_awarded'], errors='coerce').fillna(0)
-    
-    # KPI 1: Nombre de demandes spontanées
-    spontaneous_requests = subsidy_requests[subsidy_requests['request_type'] == 'Spontaneous requests']
-    kpis['nombre_demandes_spontanees'] = len(spontaneous_requests)
-    
-    # KPI 2: Montants actuellement en cours de traitement
-    in_progress = subsidy_requests[subsidy_requests['decision'].isna()]
-    kpis['montants_en_cours'] = float(in_progress['estimated_budget'].sum())
-    
-    # KPI 3: Nombre total de demandes spontanées effectuées
-    kpis['total_demandes_spontanees'] = len(spontaneous_requests)
-    
-    # KPI 4: Nombre de demandes validées par les usines
-    validated = subsidy_requests[
-        subsidy_requests['decision'].isin(['Validate all subventions', 'Validate some subventions'])
-    ]
-    kpis['nombre_demandes_validees'] = len(validated)
-    
-    # KPI 5: Montants obtenus
-    kpis['montants_obtenus'] = float(subsidy_requests['amount_awarded'].sum())
-    
-    # KPI 6: Actions réalisées et actions en retard
-    completed_actions = action_plan[action_plan['status'] == 'Completed']
-    kpis['actions_realisees'] = len(completed_actions)
-    
-    late_actions = action_plan[action_plan['status'] == 'Late']
-    kpis['actions_en_retard'] = len(late_actions)
-    
+    kpis['nombre_demandes_spontanees'] = int(spontaneous_mask.sum())
+    kpis['montants_en_cours'] = float(df.loc[in_progress_mask, 'estimated_budget'].sum())
+    kpis['nombre_demandes_validees'] = int(validated_mask.sum())
+    kpis['montants_obtenus'] = float(df['amount_awarded'].sum())
+
+    # Actions KPIs
+    kpis['actions_realisees'] = int((action_plan['status'] == 'Completed').sum())
+    kpis['actions_en_retard'] = int((action_plan['status'] == 'Late').sum())
+
+    # ------- Your Plant & Efficiency KPIs
+    # 1) Plant Requests
+    kpis['plant_requests'] = int(planned_mask.sum())
+
+    # 2) Success Rate (your formula: Won among validated)
+    denom_validated = max(int(validated_mask.sum()), 1)
+    kpis['success_rate_validated'] = float((won_mask & validated_mask).sum() / denom_validated * 100)
+
+    # (Optional alt: Approved vs Submitted) - left here for completeness
+    kpis['success_rate_submitted_alt'] = float(validated_mask.sum() / max(total_requests, 1) * 100)
+
+    # 3) Impact on Competitiveness = Σ awarded / Σ estimated (percent)
+    total_est = float(df['estimated_budget'].sum())
+    total_awd = float(df['amount_awarded'].sum())
+    kpis['impact_competitiveness'] = float((total_awd / total_est * 100) if total_est > 0 else 0.0)
+
+    # 4) % Answers (positive answers among all submitted)
+    kpis['percent_positive_answers'] = float(validated_mask.sum() / max(total_requests, 1) * 100)
+
+    # (Optional alt: any answer, approved or rejected)
+    kpis['percent_any_answer_alt'] = float(any_answer_mask.sum() / max(total_requests, 1) * 100)
+
     return kpis
 
 def calculate_kpis_by_site(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> pd.DataFrame:
-    """Calculate KPIs grouped by site location."""
-    # Convert numeric columns
-    subsidy_requests['estimated_budget'] = pd.to_numeric(subsidy_requests['estimated_budget'], errors='coerce').fillna(0)
-    subsidy_requests['amount_awarded'] = pd.to_numeric(subsidy_requests['amount_awarded'], errors='coerce').fillna(0)
-    
-    # Get unique sites from both tables
-    sites_requests = set(subsidy_requests['site_location'].dropna().unique())
-    sites_actions = set(action_plan['plant'].dropna().unique())
-    all_sites = sorted(sites_requests.union(sites_actions))
-    
-    kpis_by_site = []
-    
-    for site in all_sites:
-        site_requests = subsidy_requests[subsidy_requests['site_location'] == site]
-        site_actions = action_plan[action_plan['plant'] == site]
-        
-        spontaneous = site_requests[site_requests['request_type'] == 'Spontaneous requests']
-        in_progress = site_requests[site_requests['decision'].isna()]
-        validated = site_requests[site_requests['decision'].isin(['Validate all subventions', 'Validate some subventions'])]
-        completed = site_actions[site_actions['status'] == 'Completed']
-        late = site_actions[site_actions['status'] == 'Late']
-        
-        kpis_by_site.append({
+    df = subsidy_requests.copy()
+    ap = action_plan.copy()
+
+    # Normalize
+    df['estimated_budget'] = pd.to_numeric(df['estimated_budget'], errors='coerce').fillna(0)
+    df['amount_awarded']  = pd.to_numeric(df['amount_awarded'],  errors='coerce').fillna(0)
+
+    for col in ['request_type', 'decision', 'subsidy_outcome', 'site_location']:
+        if col in df.columns:
+            df[col] = _clean_text(df[col])
+    if 'plant' in ap.columns:
+        ap['plant'] = _clean_text(ap['plant'])
+
+    # Aggregate across union of sites in both tables
+    sites = sorted(set(df['site_location'].dropna().unique()) | set(ap['plant'].dropna().unique()))
+    rows: List[Dict] = []
+
+    for site in sites:
+        site_req = df[df['site_location'] == site]
+        site_ap  = ap[ap['plant'] == site]
+
+        total = len(site_req)
+        spontaneous_mask = site_req['request_type'].eq('Spontaneous requests')
+        planned_mask     = site_req['request_type'].eq('Planned requests')  # Plant Requests
+        validated_mask   = site_req['decision'].isin(['Validate all subventions', 'Validate some subventions'])
+        won_mask         = site_req['subsidy_outcome'].eq('Won')
+        in_progress_mask = site_req['decision'].isna()
+
+        est_sum = float(site_req['estimated_budget'].sum())
+        awd_sum = float(site_req['amount_awarded'].sum())
+
+        # Actions
+        completed = int((site_ap['status'] == 'Completed').sum())
+        late      = int((site_ap['status'] == 'Late').sum())
+
+        # KPIs per site (same names as global for consistency + your new ones)
+        row = {
             'Site': site,
-            'Demandes spontanées': len(spontaneous),
-            'Montants en cours (€)': float(in_progress['estimated_budget'].sum()),
-            'Total demandes spontanées': len(spontaneous),
-            'Demandes validées': len(validated),
-            'Montants obtenus (€)': float(site_requests['amount_awarded'].sum()),
-            'Actions réalisées': len(completed),
-            'Actions en retard': len(late)
-        })
-    
-    return pd.DataFrame(kpis_by_site)
+            'Demandes spontanées': int(spontaneous_mask.sum()),
+            'Montants en cours (€)': float(site_req.loc[in_progress_mask, 'estimated_budget'].sum()),
+            'Total demandes spontanées': int(spontaneous_mask.sum()),
+            'Demandes validées': int(validated_mask.sum()),
+            'Montants obtenus (€)': awd_sum,
+            'Actions réalisées': completed,
+            'Actions en retard': late,
+
+            # Your added KPIs
+            'Plant Requests': int(planned_mask.sum()),
+            'Success Rate (validated)%': float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
+            'Percent Positive Answers%': float(validated_mask.sum() / max(total, 1) * 100),
+            'Impact on Competitiveness%': float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 def calculate_kpis_by_project(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> pd.DataFrame:
-    """Calculate KPIs grouped by project title."""
-    # Convert numeric columns
-    subsidy_requests['estimated_budget'] = pd.to_numeric(subsidy_requests['estimated_budget'], errors='coerce').fillna(0)
-    subsidy_requests['amount_awarded'] = pd.to_numeric(subsidy_requests['amount_awarded'], errors='coerce').fillna(0)
-    
-    # Get unique projects from action plan
-    projects = action_plan['project_title'].dropna().unique()
-    
-    kpis_by_project = []
-    
-    for project in sorted(projects):
-        project_actions = action_plan[action_plan['project_title'] == project]
-        
-        # Get the plant/site for this project (take the most common one)
-        site = project_actions['plant'].mode()[0] if len(project_actions['plant'].mode()) > 0 else 'N/A'
-        
-        # Find related subsidy requests by site
-        project_requests = subsidy_requests[subsidy_requests['site_location'] == site]
-        
-        spontaneous = project_requests[project_requests['request_type'] == 'Spontaneous requests']
-        in_progress = project_requests[project_requests['decision'].isna()]
-        validated = project_requests[project_requests['decision'].isin(['Validate all subventions', 'Validate some subventions'])]
-        completed = project_actions[project_actions['status'] == 'Completed']
-        late = project_actions[project_actions['status'] == 'Late']
-        
-        kpis_by_project.append({
+    df = subsidy_requests.copy()
+    ap = action_plan.copy()
+
+    df['estimated_budget'] = pd.to_numeric(df['estimated_budget'], errors='coerce').fillna(0)
+    df['amount_awarded']  = pd.to_numeric(df['amount_awarded'],  errors='coerce').fillna(0)
+
+    for col in ['request_type', 'decision', 'subsidy_outcome', 'site_location']:
+        if col in df.columns:
+            df[col] = _clean_text(df[col])
+    for col in ['project_title', 'plant', 'status']:
+        if col in ap.columns:
+            ap[col] = _clean_text(ap[col])
+
+    projects = sorted(ap['project_title'].dropna().unique())
+    rows: List[Dict] = []
+
+    for project in projects:
+        proj_actions = ap[ap['project_title'] == project]
+
+        # Site for project = most frequent plant (if any)
+        site = proj_actions['plant'].mode()[0] if not proj_actions['plant'].mode().empty else 'N/A'
+
+        proj_reqs = df[df['site_location'] == site] if site != 'N/A' else df.iloc[0:0]
+
+        total = len(proj_reqs)
+        spontaneous_mask = proj_reqs['request_type'].eq('Spontaneous requests')
+        planned_mask     = proj_reqs['request_type'].eq('Planned requests')  # Plant Requests
+        validated_mask   = proj_reqs['decision'].isin(['Validate all subventions', 'Validate some subventions'])
+        won_mask         = proj_reqs['subsidy_outcome'].eq('Won')
+        in_progress_mask = proj_reqs['decision'].isna()
+
+        est_sum = float(proj_reqs['estimated_budget'].sum())
+        awd_sum = float(proj_reqs['amount_awarded'].sum())
+
+        completed = int((proj_actions['status'] == 'Completed').sum())
+        late      = int((proj_actions['status'] == 'Late').sum())
+
+        row = {
             'Projet': project,
             'Site': site,
-            'Demandes spontanées': len(spontaneous),
-            'Montants en cours (€)': float(in_progress['estimated_budget'].sum()),
-            'Total demandes spontanées': len(spontaneous),
-            'Demandes validées': len(validated),
-            'Montants obtenus (€)': float(project_requests['amount_awarded'].sum()),
-            'Actions réalisées': len(completed),
-            'Actions en retard': len(late)
-        })
-    
-    return pd.DataFrame(kpis_by_project)
+            'Demandes spontanées': int(spontaneous_mask.sum()),
+            'Montants en cours (€)': float(proj_reqs.loc[in_progress_mask, 'estimated_budget'].sum()),
+            'Total demandes spontanées': int(spontaneous_mask.sum()),
+            'Demandes validées': int(validated_mask.sum()),
+            'Montants obtenus (€)': awd_sum,
+            'Actions réalisées': completed,
+            'Actions en retard': late,
+
+            # Your added KPIs
+            'Plant Requests': int(planned_mask.sum()),
+            'Success Rate (validated)%': float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
+            'Percent Positive Answers%': float(validated_mask.sum() / max(total, 1) * 100),
+            'Impact on Competitiveness%': float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
 
 def get_detailed_data_for_visualization(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Prepare detailed datasets for visualization with selected columns."""
     viz_data = {}
-    
-    # Subsidy requests with key columns for visualization
     viz_data['requests_summary'] = subsidy_requests[[
-        'name', 'site_location', 'request_type', 'decision', 
+        'name', 'site_location', 'request_type', 'decision',
         'estimated_budget', 'amount_awarded', 'date_creation'
     ]].copy()
-    
-    # Action plan with key columns for visualization
+
     viz_data['actions_summary'] = action_plan[[
         'project_title', 'plant', 'status', 'action_type',
         'initiation_date', 'due_date', 'expected_gain'
     ]].copy()
-    
     return viz_data
 
+# ============================================================================
 # API Routes
-
+# ============================================================================
 @app.route('/')
 def home():
-    """Home endpoint with API documentation."""
     return jsonify({
         "message": "Subsidy KPI API",
-        "version": "1.0",
+        "version": "1.1",
         "endpoints": {
             "/api/kpis/global": "GET - Global KPIs",
             "/api/kpis/by-site": "GET - KPIs by site",
@@ -222,77 +298,55 @@ def home():
 
 @app.route('/api/kpis/global', methods=['GET'])
 def get_global_kpis():
-    """Get global KPIs."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
-        
+
         kpis = calculate_global_kpis(subsidy_requests, action_plan)
-        return jsonify({
-            "success": True,
-            "data": kpis
-        })
+        return jsonify({"success": True, "data": kpis})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/kpis/by-site', methods=['GET'])
 def get_kpis_by_site():
-    """Get KPIs grouped by site."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
-        
+
         kpis_df = calculate_kpis_by_site(subsidy_requests, action_plan)
-        return jsonify({
-            "success": True,
-            "data": kpis_df.to_dict(orient='records')
-        })
+        return jsonify({"success": True, "data": kpis_df.to_dict(orient='records')})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/kpis/by-project', methods=['GET'])
 def get_kpis_by_project():
-    """Get KPIs grouped by project."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
-        
+
         kpis_df = calculate_kpis_by_project(subsidy_requests, action_plan)
-        return jsonify({
-            "success": True,
-            "data": kpis_df.to_dict(orient='records')
-        })
+        return jsonify({"success": True, "data": kpis_df.to_dict(orient='records')})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/kpis/all', methods=['GET'])
 def get_all_kpis():
-    """Get all KPIs (global, by site, and by project)."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
-        
+
         global_kpis = calculate_global_kpis(subsidy_requests, action_plan)
         kpis_by_site = calculate_kpis_by_site(subsidy_requests, action_plan)
         kpis_by_project = calculate_kpis_by_project(subsidy_requests, action_plan)
-        
+
         return jsonify({
             "success": True,
             "data": {
@@ -302,66 +356,41 @@ def get_all_kpis():
             }
         })
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/data/requests', methods=['GET'])
 def get_requests_data():
-    """Get subsidy requests data."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         conn.close()
-        
-        # Convert DataFrame to dict with proper date handling
+
         data = json.loads(subsidy_requests.to_json(orient='records', date_format='iso'))
-        
-        return jsonify({
-            "success": True,
-            "count": len(data),
-            "data": data
-        })
+        return jsonify({"success": True, "count": len(data), "data": data})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/data/actions', methods=['GET'])
 def get_actions_data():
-    """Get action plan data."""
     try:
         conn = get_db_connection()
         action_plan = get_action_plan_data(conn)
         conn.close()
-        
-        # Convert DataFrame to dict with proper date handling
+
         data = json.loads(action_plan.to_json(orient='records', date_format='iso'))
-        
-        return jsonify({
-            "success": True,
-            "count": len(data),
-            "data": data
-        })
+        return jsonify({"success": True, "count": len(data), "data": data})
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route('/api/data/visualization', methods=['GET'])
 def get_visualization_data():
-    """Get data prepared for visualization."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
-        
+
         viz_data = get_detailed_data_for_visualization(subsidy_requests, action_plan)
-        
         return jsonify({
             "success": True,
             "data": {
@@ -370,24 +399,18 @@ def get_visualization_data():
             }
         })
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        return jsonify({"success": False, "error": str(e)}), 500
 
+# Error handlers
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({
-        "success": False,
-        "error": "Endpoint not found"
-    }), 404
+    return jsonify({"success": False, "error": "Endpoint not found"}), 404
 
 @app.errorhandler(500)
 def internal_error(error):
-    return jsonify({
-        "success": False,
-        "error": "Internal server error"
-    }), 500
+    return jsonify({"success": False, "error": "Internal server error"}), 500
 
+# Run
 if __name__ == '__main__':
+    # host=0.0.0.0 for container/VM; change port if needed
     app.run(debug=True, host='0.0.0.0', port=5000)
