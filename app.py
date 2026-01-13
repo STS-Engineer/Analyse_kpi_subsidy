@@ -90,6 +90,14 @@ MONDAY_BOARD_ACTIONS_ID: int = int(os.environ.get("MONDAY_BOARD_ACTIONS_ID", "93
 DB_TABLE_REQUESTS: str = os.environ.get("DB_TABLE_REQUESTS", "subsidy_requests")
 DB_TABLE_ACTIONS: str = os.environ.get("DB_TABLE_ACTIONS", "subsidy_action_plan")
 
+# Interval in seconds to run automatic synchronisation.  If this value
+# is set and positive, the application will start a background thread
+# that periodically synchronises the configured monday.com boards with
+# the database.  You can disable the periodic sync by setting
+# `MONDAY_SYNC_INTERVAL` to 0 or leaving it unset.  A reasonable
+# default of 300 seconds (5 minutes) is used if unspecified.
+MONDAY_SYNC_INTERVAL: int = int(os.environ.get("MONDAY_SYNC_INTERVAL", "0"))
+
 
 # ----------------------------------------------------------------------------
 # Application setup
@@ -495,6 +503,102 @@ def upsert_action_item(
         )
         return "update"
 
+# ----------------------------------------------------------------------------
+# Periodic synchronisation
+# ----------------------------------------------------------------------------
+
+def perform_sync_and_cleanup() -> Dict[str, Dict[str, int]]:
+    """Synchronise the monday.com boards with the database, including deletions.
+
+    This function performs the following steps:
+
+    1. Fetch all items from the configured requests and actions boards.
+    2. Upsert each item into the corresponding table (insert new rows or
+       update existing ones).
+    3. Identify any items that are present in the database but no longer
+       exist on the board and delete those rows.
+
+    A summary dictionary containing counts of inserts, updates and
+    deletions for each table is returned.  Any exceptions raised
+    during the process are propagated to the caller.
+    """
+    api_key = MONDAY_API_KEY or os.environ.get("MONDAY_API_KEY")
+    if not api_key:
+        raise RuntimeError("MONDAY_API_KEY env var not set")
+
+    board_requests_id = MONDAY_BOARD_REQUESTS_ID
+    board_actions_id = MONDAY_BOARD_ACTIONS_ID
+    table_requests = DB_TABLE_REQUESTS
+    table_actions = DB_TABLE_ACTIONS
+
+    # Fetch all items from both boards
+    items_requests = query_monday_items(api_key, board_requests_id)
+    items_actions = query_monday_items(api_key, board_actions_id)
+
+    summary: Dict[str, Dict[str, int]] = {
+        "requests": {"inserted": 0, "updated": 0, "deleted": 0},
+        "actions": {"inserted": 0, "updated": 0, "deleted": 0},
+    }
+
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Synchronise requests items
+                new_ids_requests = set(int(item.get("id")) for item in items_requests)
+                # Upsert items
+                for item in items_requests:
+                    action = upsert_request_item(cur, table_requests, item)
+                    summary["requests"]["inserted" if action == "insert" else "updated"] += 1
+                # Delete rows that no longer exist on the board
+                cur.execute(f"SELECT id FROM {table_requests}")
+                existing_ids_requests = {row[0] for row in cur.fetchall()}
+                ids_to_delete = existing_ids_requests - new_ids_requests
+                for old_id in ids_to_delete:
+                    cur.execute(f"DELETE FROM {table_requests} WHERE id = %s", (old_id,))
+                    summary["requests"]["deleted"] += 1
+
+                # Synchronise actions items
+                new_ids_actions = set(int(item.get("id")) for item in items_actions)
+                for item in items_actions:
+                    action2 = upsert_action_item(cur, table_actions, item)
+                    summary["actions"]["inserted" if action2 == "insert" else "updated"] += 1
+                cur.execute(f"SELECT id FROM {table_actions}")
+                existing_ids_actions = {row[0] for row in cur.fetchall()}
+                ids_to_delete_actions = existing_ids_actions - new_ids_actions
+                for old_id in ids_to_delete_actions:
+                    cur.execute(f"DELETE FROM {table_actions} WHERE id = %s", (old_id,))
+                    summary["actions"]["deleted"] += 1
+    finally:
+        conn.close()
+    return summary
+
+# Background synchronisation thread
+def _sync_thread() -> None:
+    """Internal function run in a separate thread to perform periodic syncs."""
+    # Import here to avoid circular imports when this module is imported by others
+    import time
+    while True:
+        try:
+            perform_sync_and_cleanup()
+        except Exception as exc:
+            # Print the exception rather than raising it, to keep the thread alive.
+            print(f"[sync_thread] Error during sync: {exc}")
+        # Sleep for the configured interval.  If interval is 0 or negative,
+        # exit the loop (which stops the thread).
+        interval = MONDAY_SYNC_INTERVAL
+        if interval <= 0:
+            break
+        time.sleep(interval)
+
+
+def start_periodic_sync() -> None:
+    """Start the periodic sync thread if MONDAY_SYNC_INTERVAL is positive."""
+    if MONDAY_SYNC_INTERVAL > 0:
+        import threading
+        t = threading.Thread(target=_sync_thread, daemon=True)
+        t.start()
+
 
 # ----------------------------------------------------------------------------
 # API endpoints
@@ -809,5 +913,7 @@ if __name__ == '__main__':
     # production, this application should be run by a WSGI server such
     # as Gunicorn.  The host is bound to 0.0.0.0 to allow external
     # connectivity from Docker or other containers.
+    # Optionally start periodic synchronisation before running the server.
+    start_periodic_sync()
     port = int(os.environ.get("FLASK_RUN_PORT", "5000"))
     app.run(debug=True, host='0.0.0.0', port=port)
