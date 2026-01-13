@@ -2,3 +2,4 @@ flask
 flask-cors 
 psycopg2-binary
 pandas
+requests
