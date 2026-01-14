@@ -124,7 +124,7 @@ DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")
 # Polling interval (seconds). Safer default is OFF unless explicitly set.
 MONDAY_SYNC_INTERVAL = 600
 # Always filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
-MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "").strip()
+MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "text_mks2y5v7").strip()
 MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"  # mandatory fixed value
 
 # Owner mapping
