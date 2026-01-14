@@ -25,6 +25,7 @@ from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+ALWAYS_CC_EMAIL = "sirine.khalfallah@avocarbon.com"
 
 # =============================================================================
 # Env helpers (you said "no .env": we keep env support, but everything has defaults)
@@ -158,9 +159,9 @@ MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multipl
 DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip()
 
 # Reminder schedule
-REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "mon").strip().lower()
-REMINDER_HOUR = _env_int("REMINDER_HOUR", 9)
-REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 0)
+REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "wed").strip().lower()
+REMINDER_HOUR = _env_int("REMINDER_HOUR", 17)
+REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 10)
 REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 
@@ -686,6 +687,14 @@ def start_polling_if_enabled():
 # EMAIL FUNCTIONS
 # =============================================================================
 def send_email(to_email: str, subject: str, body_html: str) -> bool:
+    """
+    Send an email using the configured SMTP settings.
+
+    Always adds Sirine in CC on every email.
+    """
+
+    ALWAYS_CC_EMAIL = "sirine.khalfallah@avocarbon.com"
+
     def _email_domain(addr: str) -> str:
         addr = (addr or "").strip().lower()
         if "@" not in addr:
@@ -697,6 +706,7 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             return True
         return _email_domain(addr) in set(SMTP_INTERNAL_DOMAINS)
 
+    # Decide auth usage
     server_host = (SMTP_SERVER or "").strip()
     server_port = int(SMTP_PORT)
 
@@ -712,29 +722,41 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
     elif auth_mode in {"login", "auth", "true", "1"}:
         use_auth = True
     else:
+        # auto
         use_auth = bool(EMAIL_PASSWORD)
+        # Office 365 MX endpoints typically do not support AUTH
         if server_port == 25 and looks_like_o365_mx:
             use_auth = False
 
+    # Build message
     msg = MIMEMultipart("alternative")
     msg["From"] = EMAIL_USER or ""
     msg["To"] = to_email
+    msg["Cc"] = ALWAYS_CC_EMAIL
     msg["Subject"] = subject
     msg.attach(MIMEText(body_html, "html"))
+
+    # Recipients list must contain TO + CC (IMPORTANT)
+    recipients = [to_email]
+    if ALWAYS_CC_EMAIL:
+        recipients.append(ALWAYS_CC_EMAIL)
 
     def _smtp_send(host: str, port: int, *, do_auth: bool) -> None:
         if not host:
             raise RuntimeError("SMTP host is empty")
 
         if not do_auth:
-            if not _is_internal_recipient(to_email):
-                raise RuntimeError(
-                    f"Refusing unauthenticated send to external domain: {to_email} (allowed: {SMTP_INTERNAL_DOMAINS})"
-                )
+            # Safety: prevent unauthenticated external sends by default
+            for r in recipients:
+                if not _is_internal_recipient(r):
+                    raise RuntimeError(
+                        f"Refusing unauthenticated send to external domain: {r} (allowed: {SMTP_INTERNAL_DOMAINS})"
+                    )
 
         with smtplib.SMTP(host, port, timeout=30) as server:
             server.ehlo()
 
+            # STARTTLS: required on 587; optional elsewhere if offered.
             want_starttls = (port == 587) or _env_bool("SMTP_USE_STARTTLS", True)
             if want_starttls and server.has_extn("starttls"):
                 server.starttls()
@@ -745,17 +767,23 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
                     raise RuntimeError("EMAIL_USER / EMAIL_PASSWORD not set for SMTP AUTH")
                 server.login(EMAIL_USER, EMAIL_PASSWORD)
 
-            server.send_message(msg)
+            # ✅ This is the complete replacement for server.send_message(msg)
+            server.sendmail(msg["From"], recipients, msg.as_string())
 
+    # 1) Try primary server
     try:
         _smtp_send(server_host, server_port, do_auth=use_auth)
-        print(f"[email] Sent to {to_email} via {server_host}:{server_port} (auth={use_auth})", flush=True)
+        print(
+            f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via {server_host}:{server_port} (auth={use_auth})",
+            flush=True
+        )
         return True
 
     except smtplib.SMTPAuthenticationError as e:
         err = str(e)
         print(f"[email] SMTP AUTH failed via {server_host}:{server_port}: {err}", flush=True)
 
+        # If basic auth is disabled, retry with configured fallback (no-auth)
         basic_auth_disabled = ("5.7.139" in err) or ("basic authentication is disabled" in err.lower())
 
         if SMTP_ALLOW_NO_AUTH_FALLBACK and basic_auth_disabled:
@@ -765,7 +793,10 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             if fb_host and (fb_host != server_host or fb_port != server_port):
                 try:
                     _smtp_send(fb_host, fb_port, do_auth=False)
-                    print(f"[email] Sent via fallback {fb_host}:{fb_port} (auth=False)", flush=True)
+                    print(
+                        f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via fallback {fb_host}:{fb_port} (auth=False)",
+                        flush=True
+                    )
                     return True
                 except Exception as e2:
                     print(f"[email] Fallback send failed via {fb_host}:{fb_port}: {e2}", flush=True)
@@ -775,7 +806,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
     except Exception as e:
         print(f"[email] Failed to send to {to_email} via {server_host}:{server_port}: {e}", flush=True)
         return False
-
 
 def get_late_actions() -> List[Dict[str, Any]]:
     conn = get_db_connection()
