@@ -124,7 +124,7 @@ DB_KEY_REQUESTS = "element_id"  # subsidy_requests.element_id
 DB_KEY_ACTIONS = "action_id"     # subsidy_action_plan.action_id
 
 # Polling interval (seconds)
-MONDAY_SYNC_INTERVAL = 5000
+MONDAY_SYNC_INTERVAL = 300
 
 # Filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
 MONDAY_ACTIONS_ASSISTANT_COL_ID = "text_mks2y5v7"
