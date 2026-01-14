@@ -8,7 +8,7 @@ import smtplib
 import atexit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Any, Set, Tuple
 
 try:
@@ -18,6 +18,7 @@ except Exception:
 
 import requests
 import psycopg2
+from psycopg2 import sql
 import pandas as pd
 from flask import Flask, jsonify
 from flask_cors import CORS
@@ -26,7 +27,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 
 # =============================================================================
-# Env helpers
+# Env helpers (you said "no .env": we keep env support, but everything has defaults)
 # =============================================================================
 def _first_env(keys: List[str], default: str = "") -> str:
     for k in keys:
@@ -69,6 +70,10 @@ def _get_timezone(tz_name: str):
         return None
 
 
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 # =============================================================================
 # Flask & CORS
 # =============================================================================
@@ -76,7 +81,7 @@ app = Flask(__name__)
 CORS(app)
 
 # =============================================================================
-# CONFIG (use Azure App Settings / env vars in production)
+# CONFIG
 # =============================================================================
 
 # PostgreSQL
@@ -107,13 +112,33 @@ SMTP_INTERNAL_DOMAINS = [
 ]
 
 # monday.com
-MONDAY_API_KEY = _first_env(["MONDAY_API_KEY"], "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzNzU5MzQ0NywiYWFpIjoxMSwidWlkIjo3NjQ5MDYwMiwiaWFkIjoiMjAyNS0wNy0xMFQxNTo0Mzo0OS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.MhRXxTDVZlx2FSnPii_PZ8dD39Q_kCdZXsrEjOCt4i4")
+MONDAY_API_KEY = _first_env(
+    ["MONDAY_API_KEY"],
+    "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzNzU5MzQ0NywiYWFpIjoxMSwidWlkIjo3NjQ5MDYwMiwiaWFkIjoiMjAyNS0wNy0xMFQxNTo0Mzo0OS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.MhRXxTDVZlx2FSnPii_PZ8dD39Q_kCdZXsrEjOCt4i4",
+)
 MONDAY_BOARD_REQUESTS_ID = int(_first_env(["MONDAY_BOARD_REQUESTS_ID"], "9612741617"))
 MONDAY_BOARD_ACTIONS_ID = int(_first_env(["MONDAY_BOARD_ACTIONS_ID"], "9366723818"))
 MONDAY_BASE_URL = _first_env(["MONDAY_BASE_URL"], "https://avocarbon.monday.com")
 
+# Actions board column IDs
 MONDAY_ACTION_ITEM_ID_COL_ID = _first_env(["MONDAY_ACTION_ITEM_ID_COL_ID"], "pulse_id_mkzk18n7")
 MONDAY_ACTION_DETAIL_COL_ID = _first_env(["MONDAY_ACTION_DETAIL_COL_ID"], "").strip()
+MONDAY_ACTION_TYPE_COL_ID = "text_mkrva3a0"  # Type of Action -> action_type
+
+# Requests board column IDs (from your board JSON)
+REQUEST_DATE_CREATION_COL_ID = "date_mkvttsk8"
+REQUEST_SITE_LOCATION_COL_ID = "dropdown_mksyv6w3"
+REQUEST_TYPE_COL_ID = "color_mkvt418p"
+REQUEST_DECISION_COL_ID = "color_mkv7m2s3"
+REQUEST_VALIDATED_COL_ID = "long_text_mkvc4t53"
+REQUEST_REJECTED_COL_ID = "long_text_mkvckt4k"
+REQUEST_ADDITIONAL_NOTES_COL_ID = "text_mkv770c5"
+REQUEST_SUBSIDY_OUTCOME_COL_ID = "color_mkw23bbc"
+REQUEST_AWARDED_PROGRAMS_COL_ID = "text_mkw89xw4"
+REQUEST_AMOUNT_AWARDED_COL_ID = "numeric_mkw2vnds"
+REQUEST_DATE_RECEIPT_COL_ID = "date_mkw383ge"
+REQUEST_ESTIMATED_BUDGET_NUM_COL_ID = "numeric_mkwrdg3z"  # prefer numeric version
+REQUEST_APPLICANT_NAME_COL_ID = "multiple_person_mkt3wpzn"  # people column -> text name
 
 # DB tables / keys
 DB_TABLE_REQUESTS = _first_env(["DB_TABLE_REQUESTS"], "subsidy_requests")
@@ -121,9 +146,10 @@ DB_TABLE_ACTIONS = _first_env(["DB_TABLE_ACTIONS"], "subsidy_action_plan")
 DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")
 DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")
 
-# Polling interval (seconds). Safer default is OFF unless explicitly set.
+# Polling interval (seconds)
 MONDAY_SYNC_INTERVAL = 600
-# Always filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
+
+# ALWAYS filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
 MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "text_mks2y5v7").strip()
 MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"  # mandatory fixed value
 
@@ -142,6 +168,33 @@ REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 ENABLE_BACKGROUND_JOBS = _env_bool("ENABLE_BACKGROUND_JOBS", True)
 ENABLE_POLLING_SYNC = _env_bool("ENABLE_POLLING_SYNC", True)
 ENABLE_EMAIL_SCHEDULER = _env_bool("ENABLE_EMAIL_SCHEDULER", True)
+
+
+# =============================================================================
+# Explicit mapping: monday column_id -> DB column name
+# =============================================================================
+# Requests mapping (fills all the DB columns you listed, as long as they exist)
+REQUESTS_COLID_TO_DB: Dict[str, str] = {
+    REQUEST_DATE_CREATION_COL_ID: "date_creation",
+    REQUEST_SITE_LOCATION_COL_ID: "site_location",
+    REQUEST_TYPE_COL_ID: "request_type",
+    REQUEST_DECISION_COL_ID: "decision",
+    REQUEST_VALIDATED_COL_ID: "validated_subventions",
+    REQUEST_REJECTED_COL_ID: "rejected_subventions",
+    REQUEST_ADDITIONAL_NOTES_COL_ID: "additional_notes",
+    REQUEST_SUBSIDY_OUTCOME_COL_ID: "subsidy_outcome",
+    REQUEST_AWARDED_PROGRAMS_COL_ID: "Names of Awarded Subvention Programs",  # keeps your DB name even if it has spaces
+    REQUEST_AMOUNT_AWARDED_COL_ID: "amount_awarded",
+    REQUEST_DATE_RECEIPT_COL_ID: "date_of_subsidy_receipt",
+    REQUEST_ESTIMATED_BUDGET_NUM_COL_ID: "estimated_budget",
+    REQUEST_APPLICANT_NAME_COL_ID: "applicant_name",
+}
+
+# Actions mapping
+ACTIONS_COLID_TO_DB: Dict[str, str] = {
+    MONDAY_ACTION_TYPE_COL_ID: "action_type",
+    MONDAY_ACTIONS_ASSISTANT_COL_ID: "assistant_generator",  # if this column exists in DB
+}
 
 
 # =============================================================================
@@ -318,32 +371,51 @@ def fetch_user_emails(api_key: str, user_ids: List[int]) -> Dict[int, str]:
 
 
 # =============================================================================
-# Mapping monday -> DB row
+# Mapping monday -> DB row (supports explicit col_id mapping + fallback)
 # =============================================================================
 def map_item_to_db_values(
     item: Dict[str, Any],
     db_columns: Set[str],
     key_col: str,
     monday_item_id: int,
+    *,
+    colid_to_db: Optional[Dict[str, str]] = None,
     is_actions_table: bool = False,
 ) -> Dict[str, Any]:
     values: Dict[str, Any] = {}
 
+    # External key (element_id/action_id)
     if key_col in db_columns:
         values[key_col] = monday_item_id
 
+    # Name
     if "name" in db_columns:
         values["name"] = item.get("name", "")
 
+    # Updated timestamp (if you have it)
+    if "updated_at" in db_columns:
+        values["updated_at"] = utc_now()
+
+    # Map columns
     for cv in item.get("column_values", []) or []:
+        col_id = cv.get("id")
+        text_val = normalize_value(cv.get("text"))
+
+        # 1) explicit mapping by monday col_id
+        if colid_to_db and col_id in colid_to_db:
+            db_col = colid_to_db[col_id]
+            if db_col in db_columns and text_val is not None:
+                values[db_col] = text_val
+            continue
+
+        # 2) fallback mapping by title -> sanitized db_guess
         col = cv.get("column") or {}
         title = col.get("title") or ""
         db_guess = sanitize_column_name(title)
-        if db_guess in db_columns:
-            v = normalize_value(cv.get("text"))
-            if v is not None:
-                values[db_guess] = v
+        if db_guess in db_columns and text_val is not None:
+            values[db_guess] = text_val
 
+    # Special: action_detail (keep your existing logic)
     if is_actions_table and "action_detail" in db_columns:
         if MONDAY_ACTION_DETAIL_COL_ID:
             for cv in item.get("column_values", []) or []:
@@ -369,6 +441,7 @@ def map_item_to_db_values(
                         values["action_detail"] = v
                     break
 
+    # Special: item_link (clickable monday URL)
     if is_actions_table and "item_link" in db_columns:
         item_id_str: str = ""
         for cv in item.get("column_values", []) or []:
@@ -382,45 +455,64 @@ def map_item_to_db_values(
 
 
 # =============================================================================
-# DB upsert/delete
+# DB upsert/delete (SAFE identifiers even if column names have spaces)
 # =============================================================================
 def exists_by_key(cur, table: str, key_col: str, key_val: int) -> bool:
-    cur.execute(f"SELECT 1 FROM {table} WHERE {key_col} = %s", (key_val,))
+    q = sql.SQL("SELECT 1 FROM {} WHERE {} = %s").format(
+        sql.Identifier(table),
+        sql.Identifier(key_col),
+    )
+    cur.execute(q, (key_val,))
     return cur.fetchone() is not None
 
 
 def insert_row(cur, table: str, values: Dict[str, Any]) -> None:
     cols = list(values.keys())
-    placeholders = ", ".join(["%s"] * len(cols))
-    col_sql = ", ".join(cols)
-    sql_stmt = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
-    cur.execute(sql_stmt, [values[c] for c in cols])
+    q = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+        sql.Identifier(table),
+        sql.SQL(", ").join(sql.Identifier(c) for c in cols),
+        sql.SQL(", ").join(sql.Placeholder() for _ in cols),
+    )
+    cur.execute(q, [values[c] for c in cols])
 
 
 def update_row(cur, table: str, key_col: str, key_val: int, values: Dict[str, Any]) -> None:
     upd_cols = [c for c in values.keys() if c != key_col]
     if not upd_cols:
         return
-    set_sql = ", ".join([f"{c} = %s" for c in upd_cols])
-    sql_stmt = f"UPDATE {table} SET {set_sql} WHERE {key_col} = %s"
+    q = sql.SQL("UPDATE {} SET {} WHERE {} = %s").format(
+        sql.Identifier(table),
+        sql.SQL(", ").join(sql.SQL("{} = %s").format(sql.Identifier(c)) for c in upd_cols),
+        sql.Identifier(key_col),
+    )
     params = [values[c] for c in upd_cols] + [key_val]
-    cur.execute(sql_stmt, params)
+    cur.execute(q, params)
 
 
-def upsert_by_key(cur, table: str, key_col: str, values: Dict[str, Any]) -> str:
+def upsert_by_key(cur, table: str, key_col: str, values: Dict[str, Any], *, db_columns: Set[str]) -> str:
     if key_col not in values:
         raise RuntimeError(f"Missing key '{key_col}' for table {table}")
+
     key_val = int(values[key_col])
-    if exists_by_key(cur, table, key_col, key_val):
-        update_row(cur, table, key_col, key_val, values)
-        return "update"
-    insert_row(cur, table, values)
-    return "insert"
+
+    # created_at only on insert if column exists and not provided
+    if not exists_by_key(cur, table, key_col, key_val):
+        if "created_at" in db_columns and "created_at" not in values:
+            values["created_at"] = utc_now()
+        insert_row(cur, table, values)
+        return "insert"
+
+    update_row(cur, table, key_col, key_val, values)
+    return "update"
 
 
 def delete_missing_by_key(cur, table: str, key_col: str, keep_ids: Set[int]) -> int:
     if not keep_ids:
-        cur.execute(f"DELETE FROM {table} WHERE {key_col} IS NOT NULL")
+        q = sql.SQL("DELETE FROM {} WHERE {} IS NOT NULL").format(
+            sql.Identifier(table),
+            sql.Identifier(key_col),
+        )
+        cur.execute(q)
         return cur.rowcount
 
     keep_list = list(keep_ids)
@@ -429,11 +521,14 @@ def delete_missing_by_key(cur, table: str, key_col: str, keep_ids: Set[int]) -> 
 
     for i in range(0, len(keep_list), chunk):
         part = keep_list[i:i + chunk]
-        placeholders = ", ".join(["%s"] * len(part))
-        cur.execute(
-            f"DELETE FROM {table} WHERE {key_col} IS NOT NULL AND {key_col} NOT IN ({placeholders})",
-            part
+        placeholders = sql.SQL(", ").join(sql.Placeholder() for _ in part)
+        q = sql.SQL("DELETE FROM {} WHERE {} IS NOT NULL AND {} NOT IN ({})").format(
+            sql.Identifier(table),
+            sql.Identifier(key_col),
+            sql.Identifier(key_col),
+            placeholders,
         )
+        cur.execute(q, part)
         deleted += cur.rowcount
 
     return deleted
@@ -463,11 +558,10 @@ def fetch_monday_items_for_sync() -> Tuple[List[Dict[str, Any]], List[Dict[str, 
         MONDAY_BOARD_ACTIONS_ID,
         MONDAY_ACTIONS_ASSISTANT_COL_ID,
         MONDAY_ACTIONS_ASSISTANT_VALUE,
-        limit=100
+        limit=100,
     )
 
     return requests_items, actions_items
-
 
 
 def perform_full_sync() -> Dict[str, Any]:
@@ -483,6 +577,7 @@ def perform_full_sync() -> Dict[str, Any]:
         req_cols = get_table_columns(conn, DB_TABLE_REQUESTS)
         act_cols = get_table_columns(conn, DB_TABLE_ACTIONS)
 
+        # Pre-fetch ALL user emails used in Actions
         all_people_ids: List[int] = []
         for it in actions_items:
             for cv in it.get("column_values", []) or []:
@@ -492,14 +587,22 @@ def perform_full_sync() -> Dict[str, Any]:
 
         with conn:
             with conn.cursor() as cur:
+                # -------- Requests
                 request_ids: Set[int] = set()
                 for it in requests_items:
                     mid = int(it["id"])
                     request_ids.add(mid)
 
-                    vals = map_item_to_db_values(it, req_cols, DB_KEY_REQUESTS, mid, is_actions_table=False)
-                    action = upsert_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, vals)
+                    vals = map_item_to_db_values(
+                        it,
+                        req_cols,
+                        DB_KEY_REQUESTS,
+                        mid,
+                        colid_to_db=REQUESTS_COLID_TO_DB,
+                        is_actions_table=False,
+                    )
 
+                    action = upsert_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, vals, db_columns=req_cols)
                     if action == "insert":
                         summary["requests"]["inserted"] += 1
                     else:
@@ -507,13 +610,22 @@ def perform_full_sync() -> Dict[str, Any]:
 
                 summary["requests"]["deleted"] = delete_missing_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, request_ids)
 
+                # -------- Actions
                 action_ids: Set[int] = set()
                 for it in actions_items:
                     mid = int(it["id"])
                     action_ids.add(mid)
 
-                    vals = map_item_to_db_values(it, act_cols, DB_KEY_ACTIONS, mid, is_actions_table=True)
+                    vals = map_item_to_db_values(
+                        it,
+                        act_cols,
+                        DB_KEY_ACTIONS,
+                        mid,
+                        colid_to_db=ACTIONS_COLID_TO_DB,
+                        is_actions_table=True,
+                    )
 
+                    # action_owner email from People column
                     owner_email: Optional[str] = None
                     for cv in it.get("column_values", []) or []:
                         if cv.get("id") == MONDAY_ACTION_OWNER_COL_ID:
@@ -529,14 +641,14 @@ def perform_full_sync() -> Dict[str, Any]:
                     if DB_ACTION_OWNER_COL in act_cols and owner_email:
                         vals[DB_ACTION_OWNER_COL] = owner_email
 
-                    action = upsert_by_key(cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, vals)
-
+                    action = upsert_by_key(cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, vals, db_columns=act_cols)
                     if action == "insert":
                         summary["actions"]["inserted"] += 1
                     else:
                         summary["actions"]["updated"] += 1
 
                 summary["actions"]["deleted"] = delete_missing_by_key(cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, action_ids)
+
     finally:
         conn.close()
 
@@ -668,7 +780,7 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
 def get_late_actions() -> List[Dict[str, Any]]:
     conn = get_db_connection()
     try:
-        query = f"""
+        query = sql.SQL("""
         SELECT
             id,
             name,
@@ -681,9 +793,10 @@ def get_late_actions() -> List[Dict[str, Any]]:
             action_type,
             due_date,
             plant
-        FROM public.{DB_TABLE_ACTIONS}
+        FROM public.{table}
         WHERE status = 'Late' AND action_owner IS NOT NULL AND action_owner != ''
-        """
+        """).format(table=sql.Identifier(DB_TABLE_ACTIONS))
+
         with conn.cursor() as cur:
             cur.execute(query)
             columns = [desc[0] for desc in cur.description]
@@ -725,12 +838,8 @@ def create_reminder_email_body(owner_email: str, actions: List[Dict[str, Any]]) 
                 <div style="font-size:16px; font-weight:bold;">Hello,</div>
             </div>
             <div class="content">
-                <p>
-                    Below is the list of <b>late subsidy actions</b> that require an update or follow-up from your side:
-                </p>
-                <ul>
-                    {items_html}
-                </ul>
+                <p>Below is the list of <b>late subsidy actions</b> that require an update or follow-up from your side:</p>
+                <ul>{items_html}</ul>
                 <p>Please share a progress update or close the actions that are already completed.</p>
                 <p>Best regards,<br/>AI Subsidy Assistant</p>
                 <div class="hint">This is an automated reminder sent to {owner_email}. Please do not reply to this email.</div>
@@ -811,10 +920,10 @@ def start_scheduler():
 
 
 # =============================================================================
-# KPI data / calculations (unchanged from your code)
+# KPI data / calculations (unchanged)
 # =============================================================================
 def get_subsidy_requests_data(connection) -> pd.DataFrame:
-    query = f"""
+    query = sql.SQL("""
     SELECT
         id,
         name,
@@ -827,13 +936,13 @@ def get_subsidy_requests_data(connection) -> pd.DataFrame:
         subsidy_outcome,
         amount_awarded,
         date_of_subsidy_receipt
-    FROM public.{DB_TABLE_REQUESTS}
-    """
+    FROM public.{table}
+    """).format(table=sql.Identifier(DB_TABLE_REQUESTS))
     return pd.read_sql_query(query, connection)
 
 
 def get_action_plan_data(connection) -> pd.DataFrame:
-    query = f"""
+    query = sql.SQL("""
     SELECT
         id,
         name,
@@ -846,8 +955,8 @@ def get_action_plan_data(connection) -> pd.DataFrame:
         due_date,
         plant,
         expected_gain
-    FROM public.{DB_TABLE_ACTIONS}
-    """
+    FROM public.{table}
+    """).format(table=sql.Identifier(DB_TABLE_ACTIONS))
     return pd.read_sql_query(query, connection)
 
 
@@ -1170,7 +1279,7 @@ def internal_error(_):
 
 
 # =============================================================================
-# Background jobs bootstrap (WSGI/Azure compatible, avoids local reloader double start)
+# Background jobs bootstrap (WSGI/Azure compatible)
 # =============================================================================
 _background_started = False
 _scheduler_instance = None
