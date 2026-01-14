@@ -1,373 +1,298 @@
-"""
-Flask application combining KPI metrics endpoints and Monday.com synchronization.
-
-This module defines a single Flask app that exposes both the KPI API and
-endpoints to synchronise data from monday.com boards into a PostgreSQL
-database.  It merges the functionality of two previously separate
-applications:
-
-* The KPI API calculates various key performance indicators based on the
-  `subsidy_requests` and `subsidy_action_plan` tables.  It exposes
-  endpoints under `/api/kpis/` for global, by-site and by-project
-  metrics, and endpoints under `/api/data/` that return raw data for
-  inspection or visualisation.
-
-* The Monday sync API listens for webhook events from monday.com and
-  provides a `/sync` endpoint to manually fetch all items from two
-  configured boards.  It stores each item in its respective table,
-  inserting new rows or updating existing ones based on the item's
-  numeric ID.  The webhook endpoint (`/webhook`) handles creation,
-  updates and deletion of individual items as they happen.
-
-The unified app is configured via environment variables.  For database
-connectivity, it respects the same variables as the original KPI API:
-
-* **PGHOST** – PostgreSQL server host
-* **PGDATABASE** – database name
-* **PGUSER** – database user
-* **PGPASSWORD** – database user password
-* **PGPORT** – database port (default 5432)
-* **PGSSLMODE** – PostgreSQL SSL mode (default "require")
-
-For monday.com integration the following variables are used:
-
-* **MONDAY_API_KEY** – API token used to authenticate API requests.
-* **MONDAY_BOARD_REQUESTS_ID** – ID of the board containing subsidy
-  request items (default 9612741617).
-* **MONDAY_BOARD_ACTIONS_ID** – ID of the board containing action
-  plan items (default 9366723818).
-* **DB_TABLE_REQUESTS** – name of the table for request items
-  (default "subsidy_requests").
-* **DB_TABLE_ACTIONS** – name of the table for action items
-  (default "subsidy_action_plan").
-
-If psycopg2 has been compiled without SSL support, SSL may be disabled
-by setting the PGSSLMODE environment variable appropriately.  The
-defaults match the provided examples.
-"""
-
-import json
 import os
+import re
+import json
+import time
+import threading
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import date, datetime
-from typing import Dict, List, Optional
-
-import pandas as pd
-import requests
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from typing import Dict, List, Optional, Any, Set, Tuple
 
 try:
-    import psycopg2
-    from psycopg2.extras import Json
-except ImportError:
-    psycopg2 = None  # type: ignore
+    # Python 3.9+
+    from zoneinfo import ZoneInfo  # type: ignore
+except Exception:
+    ZoneInfo = None  # type: ignore
+
+import requests
+import psycopg2
+import pandas as pd
+from flask import Flask, jsonify
+from flask_cors import CORS
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+# =============================================================================
+# Load .env (optional)
+# =============================================================================
+def _load_dotenv_if_present() -> None:
+    """Load environment variables from a .env file if present.
+
+    - Uses python-dotenv if installed.
+    - Falls back to a minimal KEY=VALUE parser.
+    """
+    # 1) python-dotenv (best)
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(override=False)
+        return
+    except Exception:
+        pass
+
+    # 2) minimal fallback parser
+    preexisting = set(os.environ.keys())
+
+    candidates: List[str] = []
+    try:
+        candidates.append(os.path.join(os.getcwd(), ".env"))
+    except Exception:
+        pass
+    try:
+        candidates.append(os.path.join(os.path.dirname(__file__), ".env"))
+    except Exception:
+        pass
+
+    for env_path in candidates:
+        if not env_path or not os.path.isfile(env_path):
+            continue
+        try:
+            parsed: Dict[str, str] = {}
+            with open(env_path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if not key:
+                        continue
+                    # remove surrounding quotes
+                    if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                        val = val[1:-1]
+                    # last definition wins within the .env file
+                    parsed[key] = val
+
+            for k, v in parsed.items():
+                if k not in preexisting:
+                    os.environ[k] = v
+        except Exception:
+            # best-effort: never crash startup because of .env parsing
+            pass
 
 
-# ----------------------------------------------------------------------------
-# Configuration
-# ----------------------------------------------------------------------------
+_load_dotenv_if_present()
 
-# Database configuration derived from environment variables.  The
-# environment variables allow overriding of host, database name, user
-# credentials, port, and SSL mode.  Defaults are provided to allow
-# running in development without additional configuration.
+
+def _first_env(keys: List[str], default: str = "") -> str:
+    """Return the first non-empty environment variable among keys."""
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.getenv(key)
+    if v is None:
+        return default
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_int(key: str, default: int) -> int:
+    v = os.getenv(key)
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return default
+
+
+def _get_timezone(tz_name: str):
+    tz_name = (tz_name or "").strip()
+    if not tz_name:
+        return None
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tz_name)
+        except Exception:
+            pass
+    try:
+        import pytz  # type: ignore
+        return pytz.timezone(tz_name)
+    except Exception:
+        return None
+
+
+# =============================================================================
+# Flask & CORS
+# =============================================================================
+app = Flask(__name__)
+CORS(app)
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+# PostgreSQL settings (supports both PG* and DB_* env names)
 DB_CONFIG = {
-    "host": os.getenv("PGHOST", "avo-adb-002.postgres.database.azure.com"),
-    "database": os.getenv("PGDATABASE", "Subsidy_DB"),
-    "user": os.getenv("PGUSER", "administrationSTS"),
-    "password": os.getenv("PGPASSWORD", "St$@0987"),
-    "port": int(os.getenv("PGPORT", "5432")),
-    # psycopg2 accepts the sslmode parameter; default to 'require' to
-    # ensure secure connections unless explicitly overridden.
-    "sslmode": os.getenv("PGSSLMODE", "require"),
+    "host": _first_env(["PGHOST", "DB_HOST"], "avo-adb-002.postgres.database.azure.com"),
+    "database": _first_env(["PGDATABASE", "DB_NAME"], "Subsidy_DB"),
+    "user": _first_env(["PGUSER", "DB_USER"], "administrationSTS"),
+    "password": _first_env(["PGPASSWORD", "DB_PASSWORD"], ""),
+    "port": int(_first_env(["PGPORT", "DB_PORT"], "5432")),
+    "sslmode": _first_env(["PGSSLMODE"], "require"),
 }
 
-# Monday.com integration configuration.  These variables can be set
-# externally to configure the API key and board IDs.
-MONDAY_API_KEY: Optional[str] = os.environ.get("MONDAY_API_KEY")
-MONDAY_BOARD_REQUESTS_ID: int = int(os.environ.get("MONDAY_BOARD_REQUESTS_ID", "9612741617"))
-MONDAY_BOARD_ACTIONS_ID: int = int(os.environ.get("MONDAY_BOARD_ACTIONS_ID", "9366723818"))
-DB_TABLE_REQUESTS: str = os.environ.get("DB_TABLE_REQUESTS", "subsidy_requests")
-DB_TABLE_ACTIONS: str = os.environ.get("DB_TABLE_ACTIONS", "subsidy_action_plan")
+# Email settings
+SMTP_SERVER = _first_env(["SMTP_SERVER", "EMAIL_HOST"], "")
+SMTP_PORT = int(_first_env(["SMTP_PORT", "EMAIL_PORT"], "587"))
+EMAIL_USER = _first_env(["EMAIL_USER"], "")
+EMAIL_PASSWORD = _first_env(["EMAIL_PASSWORD", "EMAIL_PASS"], "")
 
-# Interval in seconds to run automatic synchronisation.  If this value
-# is set and positive, the application will start a background thread
-# that periodically synchronises the configured monday.com boards with
-# the database.  You can disable the periodic sync by setting
-# `MONDAY_SYNC_INTERVAL` to 0 or leaving it unset.  A reasonable
-# default of 300 seconds (5 minutes) is used if unspecified.
-MONDAY_SYNC_INTERVAL: int = int(os.environ.get("MONDAY_SYNC_INTERVAL", "0"))
+# Optional unauthenticated fallback (Direct Send / SMTP relay on port 25)
+SMTP_FALLBACK_SERVER = _first_env(["SMTP_FALLBACK_SERVER", "EMAIL_HOST"], "")
+SMTP_FALLBACK_PORT = int(_first_env(["SMTP_FALLBACK_PORT", "EMAIL_PORT"], "25"))
+SMTP_AUTH_MODE = _first_env(["SMTP_AUTH_MODE"], "auto").lower()  # auto | login | none
+SMTP_ALLOW_NO_AUTH_FALLBACK = _env_bool("SMTP_ALLOW_NO_AUTH_FALLBACK", True)
+
+# Restrict unauthenticated sends to internal domains (recommended)
+SMTP_INTERNAL_DOMAINS = [
+    d.strip().lower()
+    for d in _first_env(["SMTP_INTERNAL_DOMAINS"], "").split(",")
+    if d.strip()
+]
+if not SMTP_INTERNAL_DOMAINS and "@" in EMAIL_USER:
+    SMTP_INTERNAL_DOMAINS = [EMAIL_USER.split("@", 1)[1].lower()]
+
+# monday.com settings
+MONDAY_API_KEY = _first_env(["MONDAY_API_KEY"], "")
+MONDAY_BOARD_REQUESTS_ID = int(_first_env(["MONDAY_BOARD_REQUESTS_ID"], "9612741617"))
+MONDAY_BOARD_ACTIONS_ID = int(_first_env(["MONDAY_BOARD_ACTIONS_ID"], "9366723818"))
+
+# monday.com base URL (used to build clickable item links)
+MONDAY_BASE_URL = _first_env(["MONDAY_BASE_URL"], "https://avocarbon.monday.com")
+
+# monday.com column IDs (actions board)
+# "Identifiant de l'élément" (type item_id)
+MONDAY_ACTION_ITEM_ID_COL_ID = _first_env(["MONDAY_ACTION_ITEM_ID_COL_ID"], "pulse_id_mkzk18n7")
+# "Action détaillé" (set this env var to the exact monday column id)
+MONDAY_ACTION_DETAIL_COL_ID = _first_env(["MONDAY_ACTION_DETAIL_COL_ID"], "").strip()
+
+# Tables
+DB_TABLE_REQUESTS = _first_env(["DB_TABLE_REQUESTS"], "subsidy_requests")
+DB_TABLE_ACTIONS = _first_env(["DB_TABLE_ACTIONS"], "subsidy_action_plan")
+
+# External keys (monday item ID stored here)
+DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")  # subsidy_requests.element_id
+DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")     # subsidy_action_plan.action_id
+
+# Polling interval (seconds)
+MONDAY_SYNC_INTERVAL = int(_first_env(["MONDAY_SYNC_INTERVAL"], "0"))
+
+# Optional: filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
+# You MUST provide the column ID (not the title).
+MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "").strip()
+MONDAY_ACTIONS_ASSISTANT_VALUE = _first_env(["MONDAY_ACTIONS_ASSISTANT_VALUE"], "AI Subsidy Assistant").strip()
+
+# Action owner mapping (People / Multiple persons column)
+MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multiple_person_mkv090pp").strip()
+DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip()
+
+# Reminder schedule (timezone-aware)
+REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "mon").strip().lower()
+REMINDER_HOUR = _env_int("REMINDER_HOUR", 9)
+REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 0)
+REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
+REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 
 
-# ----------------------------------------------------------------------------
-# Application setup
-# ----------------------------------------------------------------------------
-
-app = Flask(__name__)
-cors = CORS(app)
-
-
-# ----------------------------------------------------------------------------
-# Utility classes and functions
-# ----------------------------------------------------------------------------
-
+# =============================================================================
+# Helpers
+# =============================================================================
 class DateTimeEncoder(json.JSONEncoder):
-    """Custom JSON encoder to serialise date and datetime objects."""
-
-    def default(self, obj):  # type: ignore[override]
+    def default(self, obj):
         if isinstance(obj, (date, datetime)):
             return obj.isoformat()
         return super().default(obj)
 
 
 def get_db_connection():
-    """Establish a new database connection.
+    try:
+        return psycopg2.connect(**DB_CONFIG)
+    except psycopg2.Error as e:
+        raise Exception(f"Database connection error: {e}")
 
-    Returns a new connection to the PostgreSQL database using the
-    configured settings.  A runtime error is raised if psycopg2 is not
-    installed.
+
+def sanitize_column_name(title: str) -> str:
+    t = (title or "").strip().lower()
+    t = re.sub(r"[^a-z0-9]+", "_", t)
+    return t.strip("_")
+
+
+def normalize_value(text: Any) -> Any:
     """
-    if psycopg2 is None:
-        raise RuntimeError(
-            "psycopg2 is required for database connectivity but is not installed. "
-            "Install it with 'pip install psycopg2-binary'."
-        )
-    return psycopg2.connect(**DB_CONFIG)
-
-
-def get_subsidy_requests_data(connection) -> pd.DataFrame:
-    """Retrieve subsidy request data from the database."""
-    query = """
-    SELECT 
-        id,
-        name,
-        applicant_name,
-        site_location,
-        decision,
-        date_creation,
-        request_type,
-        estimated_budget,
-        subsidy_outcome,
-        amount_awarded,
-        date_of_subsidy_receipt
-    FROM {};
-    """.format(DB_TABLE_REQUESTS)
-    return pd.read_sql_query(query, connection)
-
-
-def get_action_plan_data(connection) -> pd.DataFrame:
-    """Retrieve action plan data from the database."""
-    query = """
-    SELECT 
-        id,
-        name,
-        action_id,
-        project_title,
-        status,
-        action_type,
-        initiation_date,
-        due_date,
-        plant,
-        expected_gain
-    FROM {};
-    """.format(DB_TABLE_ACTIONS)
-    return pd.read_sql_query(query, connection)
-
-
-def _clean_text(series: pd.Series) -> pd.Series:
-    """Normalise text by stripping whitespace and converting to string."""
-    return series.astype(str).str.strip()
-
-
-def calculate_global_kpis(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict[str, float]:
-    """Calculate high-level KPI metrics across all subsidy requests and actions."""
-    df = subsidy_requests.copy()
-    ap = action_plan.copy()
-
-    # Normalise numeric columns
-    df['estimated_budget'] = pd.to_numeric(df['estimated_budget'], errors='coerce').fillna(0)
-    df['amount_awarded'] = pd.to_numeric(df['amount_awarded'], errors='coerce').fillna(0)
-
-    # Clean relevant text columns
-    for col in ['request_type', 'decision', 'subsidy_outcome', 'site_location']:
-        if col in df.columns:
-            df[col] = _clean_text(df[col])
-
-    # Define boolean masks for counting
-    total_requests = len(df)
-    spontaneous_mask = df['request_type'].eq('Spontaneous requests')
-    planned_mask = df['request_type'].eq('Planned requests')
-    validated_mask = df['decision'].isin(['Validate all subventions', 'Validate some subventions'])
-    any_answer_mask = df['decision'].notna()
-    won_mask = df['subsidy_outcome'].eq('Won')
-    in_progress_mask = df['decision'].isna()
-
-    kpis: Dict[str, float] = {}
-    kpis['nombre_demandes_spontanees'] = float(spontaneous_mask.sum())
-    kpis['montants_en_cours'] = float(df.loc[in_progress_mask, 'estimated_budget'].sum())
-    kpis['nombre_demandes_validees'] = float(validated_mask.sum())
-    kpis['montants_obtenus'] = float(df['amount_awarded'].sum())
-
-    # Action-related KPIs
-    kpis['actions_realisees'] = float((action_plan['status'] == 'Completed').sum())
-    kpis['actions_en_retard'] = float((action_plan['status'] == 'Late').sum())
-
-    # Additional KPIs requested
-    kpis['plant_requests'] = float(planned_mask.sum())
-
-    denom_validated = max(int(validated_mask.sum()), 1)
-    kpis['success_rate_validated'] = float((won_mask & validated_mask).sum() / denom_validated * 100)
-    # optional alternative measure left for completeness
-    kpis['success_rate_submitted_alt'] = float(validated_mask.sum() / max(total_requests, 1) * 100)
-
-    total_est = float(df['estimated_budget'].sum())
-    total_awd = float(df['amount_awarded'].sum())
-    kpis['impact_competitiveness'] = float((total_awd / total_est * 100) if total_est > 0 else 0.0)
-
-    kpis['percent_positive_answers'] = float(validated_mask.sum() / max(total_requests, 1) * 100)
-    kpis['percent_any_answer_alt'] = float(any_answer_mask.sum() / max(total_requests, 1) * 100)
-    return kpis
-
-
-def calculate_kpis_by_site(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> pd.DataFrame:
-    """Calculate KPI metrics grouped by site location."""
-    df = subsidy_requests.copy()
-    ap = action_plan.copy()
-
-    # Normalise numeric and text columns
-    df['estimated_budget'] = pd.to_numeric(df['estimated_budget'], errors='coerce').fillna(0)
-    df['amount_awarded'] = pd.to_numeric(df['amount_awarded'], errors='coerce').fillna(0)
-    for col in ['request_type', 'decision', 'subsidy_outcome', 'site_location']:
-        if col in df.columns:
-            df[col] = _clean_text(df[col])
-    if 'plant' in ap.columns:
-        ap['plant'] = _clean_text(ap['plant'])
-
-    # Determine unique sites across both tables
-    sites = sorted(set(df['site_location'].dropna().unique()) | set(ap['plant'].dropna().unique()))
-    rows: List[Dict[str, float]] = []
-
-    for site in sites:
-        site_req = df[df['site_location'] == site]
-        site_ap = ap[ap['plant'] == site]
-
-        total = len(site_req)
-        spontaneous_mask = site_req['request_type'].eq('Spontaneous requests')
-        planned_mask = site_req['request_type'].eq('Planned requests')
-        validated_mask = site_req['decision'].isin(['Validate all subventions', 'Validate some subventions'])
-        won_mask = site_req['subsidy_outcome'].eq('Won')
-        in_progress_mask = site_req['decision'].isna()
-
-        est_sum = float(site_req['estimated_budget'].sum())
-        awd_sum = float(site_req['amount_awarded'].sum())
-
-        completed = float((site_ap['status'] == 'Completed').sum())
-        late = float((site_ap['status'] == 'Late').sum())
-
-        row: Dict[str, float] = {
-            'Site': site,
-            'Demandes spontanées': float(spontaneous_mask.sum()),
-            'Montants en cours (€)': float(site_req.loc[in_progress_mask, 'estimated_budget'].sum()),
-            'Total demandes spontanées': float(spontaneous_mask.sum()),
-            'Demandes validées': float(validated_mask.sum()),
-            'Montants obtenus (€)': awd_sum,
-            'Actions réalisées': completed,
-            'Actions en retard': late,
-            'Plant Requests': float(planned_mask.sum()),
-            'Success Rate (validated)%': float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
-            'Percent Positive Answers%': float(validated_mask.sum() / max(total, 1) * 100),
-            'Impact on Competitiveness%': float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
-        }
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def calculate_kpis_by_project(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> pd.DataFrame:
-    """Calculate KPI metrics grouped by project (title) as defined in the action plan."""
-    df = subsidy_requests.copy()
-    ap = action_plan.copy()
-
-    df['estimated_budget'] = pd.to_numeric(df['estimated_budget'], errors='coerce').fillna(0)
-    df['amount_awarded'] = pd.to_numeric(df['amount_awarded'], errors='coerce').fillna(0)
-
-    for col in ['request_type', 'decision', 'subsidy_outcome', 'site_location']:
-        if col in df.columns:
-            df[col] = _clean_text(df[col])
-    for col in ['project_title', 'plant', 'status']:
-        if col in ap.columns:
-            ap[col] = _clean_text(ap[col])
-
-    projects = sorted(ap['project_title'].dropna().unique())
-    rows: List[Dict[str, float]] = []
-
-    for project in projects:
-        proj_actions = ap[ap['project_title'] == project]
-        site = proj_actions['plant'].mode()[0] if not proj_actions['plant'].mode().empty else 'N/A'
-        proj_reqs = df[df['site_location'] == site] if site != 'N/A' else df.iloc[0:0]
-
-        total = len(proj_reqs)
-        spontaneous_mask = proj_reqs['request_type'].eq('Spontaneous requests')
-        planned_mask = proj_reqs['request_type'].eq('Planned requests')
-        validated_mask = proj_reqs['decision'].isin(['Validate all subventions', 'Validate some subventions'])
-        won_mask = proj_reqs['subsidy_outcome'].eq('Won')
-        in_progress_mask = proj_reqs['decision'].isna()
-
-        est_sum = float(proj_reqs['estimated_budget'].sum())
-        awd_sum = float(proj_reqs['amount_awarded'].sum())
-
-        completed = float((proj_actions['status'] == 'Completed').sum())
-        late = float((proj_actions['status'] == 'Late').sum())
-
-        row: Dict[str, float] = {
-            'Projet': project,
-            'Site': site,
-            'Demandes spontanées': float(spontaneous_mask.sum()),
-            'Montants en cours (€)': float(proj_reqs.loc[in_progress_mask, 'estimated_budget'].sum()),
-            'Total demandes spontanées': float(spontaneous_mask.sum()),
-            'Demandes validées': float(validated_mask.sum()),
-            'Montants obtenus (€)': awd_sum,
-            'Actions réalisées': completed,
-            'Actions en retard': late,
-            'Plant Requests': float(planned_mask.sum()),
-            'Success Rate (validated)%': float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
-            'Percent Positive Answers%': float(validated_mask.sum() / max(total, 1) * 100),
-            'Impact on Competitiveness%': float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
-        }
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def get_detailed_data_for_visualization(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """Return simplified data structures for charting or front-end visualisation."""
-    viz_data: Dict[str, pd.DataFrame] = {}
-    viz_data['requests_summary'] = subsidy_requests[[
-        'name', 'site_location', 'request_type', 'decision',
-        'estimated_budget', 'amount_awarded', 'date_creation'
-    ]].copy()
-    viz_data['actions_summary'] = action_plan[[
-        'project_title', 'plant', 'status', 'action_type',
-        'initiation_date', 'due_date', 'expected_gain'
-    ]].copy()
-    return viz_data
-
-
-# ----------------------------------------------------------------------------
-# Monday.com helper functions
-# ----------------------------------------------------------------------------
-
-def query_monday_items(api_key: str, board_id: int) -> List[Dict[str, any]]:
-    """Fetch all items from a monday.com board using the GraphQL API.
-
-    Returns a list of items with their column values.  Raises a
-    RuntimeError if the API call fails or returns errors.
+    - empty string -> None (prevents numeric/date errors)
+    - numeric-like strings -> int / float
     """
-    # GraphQL query: ask for items and their column values on the board
+    if text is None:
+        return None
+    if isinstance(text, str):
+        s = text.strip()
+        if s == "":
+            return None
+        if re.fullmatch(r"-?\d+", s):
+            try:
+                return int(s)
+            except Exception:
+                return s
+        if re.fullmatch(r"-?\d+(\.\d+)?", s):
+            try:
+                return float(s)
+            except Exception:
+                return s
+        return s
+    return text
+
+
+def get_table_columns(conn, table: str) -> Set[str]:
+    q = """
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema='public' AND table_name=%s
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, (table,))
+        return {r[0] for r in cur.fetchall()}
+
+
+# =============================================================================
+# monday.com API
+# =============================================================================
+def monday_query(api_key: str, query: str) -> Dict[str, Any]:
+    api_url = "https://api.monday.com/v2"
+    headers = {"Authorization": api_key}
+    resp = requests.post(api_url, json={"query": query}, headers=headers, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"monday API error {resp.status_code}: {resp.text}")
+    data = resp.json()
+    if "errors" in data:
+        raise RuntimeError(f"monday API returned errors: {data['errors']}")
+    return data
+
+
+def query_monday_items(api_key: str, board_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    """
+    Fetch items from a board (first page).
+    IMPORTANT: includes column_values.value so we can extract People column IDs.
+    """
     query = f"""
     {{
       boards(ids: {board_id}) {{
-        items_page(limit: 100) {{
+        items_page(limit: {limit}) {{
           items {{
             id
             name
@@ -382,538 +307,1164 @@ def query_monday_items(api_key: str, board_id: int) -> List[Dict[str, any]]:
       }}
     }}
     """
-    api_url = "https://api.monday.com/v2"
-    headers = {"Authorization": api_key}
-    data = {"query": query}
-    response = requests.post(api_url, json=data, headers=headers)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"monday.com API call failed with status {response.status_code}: {response.text}"
-        )
-    result = response.json()
-    if "errors" in result:
-        raise RuntimeError(f"monday.com API returned errors: {result['errors']}")
-    boards = result.get("data", {}).get("boards", [])
+    data = monday_query(api_key, query)
+    boards = data.get("data", {}).get("boards", [])
     if not boards:
         return []
     return boards[0].get("items_page", {}).get("items", [])
 
 
-def query_monday_item(api_key: str, board_id: int, item_id: int) -> Optional[Dict[str, any]]:
-    """Fetch a single item by its ID from a monday.com board."""
+def query_monday_actions_filtered(
+    api_key: str,
+    board_id: int,
+    column_id: str,
+    column_value: str,
+    limit: int = 100
+) -> List[Dict[str, Any]]:
+    """
+    Fetch only actions items matching a column filter.
+    IMPORTANT: includes column_values.value so we can extract People column IDs.
+    """
     query = f"""
     {{
-      items(ids: [{item_id}]) {{
-        id
-        name
-        column_values {{
+      items_page_by_column_values(
+        board_id: {board_id},
+        columns: [{{ column_id: "{column_id}", column_values: ["{column_value}"] }}],
+        limit: {limit}
+      ) {{
+        items {{
           id
-          text
-          value
-          column {{ title }}
+          name
+          column_values {{
+            id
+            text
+            value
+            column {{ title }}
+          }}
         }}
       }}
     }}
     """
-    api_url = "https://api.monday.com/v2"
-    headers = {"Authorization": api_key}
-    data = {"query": query}
-    response = requests.post(api_url, json=data, headers=headers)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"monday.com API call failed with status {response.status_code}: {response.text}"
-        )
-    result = response.json()
-    if "errors" in result:
-        raise RuntimeError(f"monday.com API returned errors: {result['errors']}")
-    items = result.get("data", {}).get("items", [])
-    return items[0] if items else None
+    data = monday_query(api_key, query)
+    return data.get("data", {}).get("items_page_by_column_values", {}).get("items", [])
 
 
-def upsert_request_item(
-    cursor: "psycopg2.extensions.cursor", table: str, item: Dict[str, any]
-) -> str:
-    """Insert or update a row in the requests table.
-
-    Uses the numeric item ID as the primary key.  If an existing row
-    with the same ID exists, its name and column_values fields are
-    updated.  Otherwise, a new row is inserted.
+# =============================================================================
+# People column -> emails (Action Owner)
+# =============================================================================
+def extract_people_ids_from_value(value_str: Optional[str]) -> List[int]:
     """
-    item_id = int(item.get("id"))
-    name = item.get("name", "")
-    values_dict: Dict[str, Optional[str]] = {}
-    for cv in item.get("column_values", []):
-        col_id = cv.get("id")
-        text = cv.get("text")
-        values_dict[col_id] = text
+    monday People (multiple) column 'value' is JSON like:
+    {"personsAndTeams":[{"id":76490602,"kind":"person"}, ...]}
+    """
+    if not value_str:
+        return []
+    try:
+        data = json.loads(value_str)
+    except Exception:
+        return []
 
-    # Determine whether the row exists
-    cursor.execute(f"SELECT 1 FROM {table} WHERE id = %s", (item_id,))
-    exists = cursor.fetchone()
-    if exists is None:
-        cursor.execute(
-            f"INSERT INTO {table} (id, name, column_values) VALUES (%s, %s, %s)",
-            (item_id, name, Json(values_dict)),
-        )
-        return "insert"
-    else:
-        cursor.execute(
-            f"UPDATE {table} SET name = %s, column_values = %s WHERE id = %s",
-            (name, Json(values_dict), item_id),
-        )
+    pts = data.get("personsAndTeams", []) or []
+    ids: List[int] = []
+    for x in pts:
+        if x.get("kind") == "person" and "id" in x:
+            try:
+                ids.append(int(x["id"]))
+            except Exception:
+                pass
+    return ids
+
+
+def fetch_user_emails(api_key: str, user_ids: List[int]) -> Dict[int, str]:
+    """
+    Returns {user_id: email}
+    """
+    if not user_ids:
+        return {}
+
+    unique_ids = sorted(set(int(i) for i in user_ids))
+    ids_csv = ",".join(str(i) for i in unique_ids)
+
+    query = f"""
+    {{
+      users(ids: [{ids_csv}]) {{
+        id
+        email
+      }}
+    }}
+    """
+    data = monday_query(api_key, query)
+    users = data.get("data", {}).get("users", []) or []
+    out: Dict[int, str] = {}
+    for u in users:
+        try:
+            uid = int(u["id"])
+            out[uid] = (u.get("email") or "").strip()
+        except Exception:
+            pass
+    return out
+
+
+# =============================================================================
+# Mapping monday -> DB row (ONLY columns that exist)
+# =============================================================================
+def map_item_to_db_values(
+    item: Dict[str, Any],
+    db_columns: Set[str],
+    key_col: str,
+    monday_item_id: int,
+    is_actions_table: bool = False,
+) -> Dict[str, Any]:
+    """
+    Builds dict of db_col -> value only for columns that exist in DB.
+    Always sets:
+      - key_col (element_id/action_id) = monday item id
+      - name = item.name (if exists)
+    """
+    values: Dict[str, Any] = {}
+
+    if key_col in db_columns:
+        values[key_col] = monday_item_id
+
+    if "name" in db_columns:
+        values["name"] = item.get("name", "")
+
+    for cv in item.get("column_values", []) or []:
+        col = cv.get("column") or {}
+        title = col.get("title") or ""
+        db_guess = sanitize_column_name(title)
+        if db_guess in db_columns:
+            v = normalize_value(cv.get("text"))
+            if v is not None:
+                values[db_guess] = v
+
+    # ------------------------------------------------------------------------
+    # Special mappings for actions board
+    # ------------------------------------------------------------------------
+
+    # 1) action_detail mapping
+    # Preferred: map by monday column id (stable even if title changes / accents).
+    # Fallback: match by column title for backward compatibility.
+    if is_actions_table and "action_detail" in db_columns:
+        # By column id (recommended)
+        if MONDAY_ACTION_DETAIL_COL_ID:
+            for cv in item.get("column_values", []) or []:
+                if cv.get("id") == MONDAY_ACTION_DETAIL_COL_ID:
+                    v = normalize_value(cv.get("text"))
+                    if v is not None:
+                        values["action_detail"] = v
+                    break
+        else:
+            # Fallback by title
+            for cv in item.get("column_values", []) or []:
+                col = cv.get("column") or {}
+                title = (col.get("title") or "").strip().lower()
+                if title in {
+                    "ai subsidy assistant",
+                    "action détaillé",
+                    "action detaille",
+                    "action detail",
+                    "detailed action",
+                    "action details",
+                }:
+                    v = normalize_value(cv.get("text"))
+                    if v is not None:
+                        values["action_detail"] = v
+                    break
+
+    # 2) item_link mapping (clickable monday item URL)
+    # Uses the monday item_id column "Identifiant de l'élément" (type item_id).
+    if is_actions_table and "item_link" in db_columns:
+        item_id_str: str = ""
+        for cv in item.get("column_values", []) or []:
+            if cv.get("id") == MONDAY_ACTION_ITEM_ID_COL_ID:
+                item_id_str = (cv.get("text") or "").strip()
+                break
+        if item_id_str:
+            values["item_link"] = f"{MONDAY_BASE_URL}/boards/{MONDAY_BOARD_ACTIONS_ID}/pulses/{item_id_str}"
+
+    return values
+
+
+
+# =============================================================================
+# DB upsert/delete using external keys (element_id / action_id)
+# =============================================================================
+def exists_by_key(cur, table: str, key_col: str, key_val: int) -> bool:
+    cur.execute(f"SELECT 1 FROM {table} WHERE {key_col} = %s", (key_val,))
+    return cur.fetchone() is not None
+
+
+def insert_row(cur, table: str, values: Dict[str, Any]) -> None:
+    cols = list(values.keys())
+    placeholders = ", ".join(["%s"] * len(cols))
+    col_sql = ", ".join(cols)
+    sql_stmt = f"INSERT INTO {table} ({col_sql}) VALUES ({placeholders})"
+    cur.execute(sql_stmt, [values[c] for c in cols])
+
+
+def update_row(cur, table: str, key_col: str, key_val: int, values: Dict[str, Any]) -> None:
+    upd_cols = [c for c in values.keys() if c != key_col]
+    if not upd_cols:
+        return
+    set_sql = ", ".join([f"{c} = %s" for c in upd_cols])
+    sql_stmt = f"UPDATE {table} SET {set_sql} WHERE {key_col} = %s"
+    params = [values[c] for c in upd_cols] + [key_val]
+    cur.execute(sql_stmt, params)
+
+
+def upsert_by_key(cur, table: str, key_col: str, values: Dict[str, Any]) -> str:
+    """
+    Upsert using external key_col (element_id/action_id).
+    Does NOT touch identity column id.
+    Returns "insert" or "update".
+    """
+    if key_col not in values:
+        raise RuntimeError(f"Missing key '{key_col}' for table {table}")
+
+    key_val = int(values[key_col])
+
+    if exists_by_key(cur, table, key_col, key_val):
+        update_row(cur, table, key_col, key_val, values)
         return "update"
 
+    insert_row(cur, table, values)
+    return "insert"
 
-def upsert_action_item(
-    cursor: "psycopg2.extensions.cursor", table: str, item: Dict[str, any]
-) -> str:
-    """Insert or update a row in the action plan table.
 
-    Stores the value of the "AI subsidy assistant" column, if present,
-    in an `action_detail` column.  The other column values are stored
-    as JSON in the `column_values` column.  Rows are matched using the
-    item ID as the primary key.
+def delete_missing_by_key(cur, table: str, key_col: str, keep_ids: Set[int]) -> int:
     """
-    item_id = int(item.get("id"))
-    name = item.get("name", "")
-    action_detail: Optional[str] = None
-    values_dict: Dict[str, Optional[str]] = {}
-    for cv in item.get("column_values", []):
-        col_id = cv.get("id")
-        text = cv.get("text")
-        values_dict[col_id] = text
-        column_info = cv.get("column") or {}
-        title = column_info.get("title")
-        if title and title.strip().lower() == "ai subsidy assistant".lower():
-            action_detail = text
+    Delete rows whose key_col is not in keep_ids.
+    NOTE: If you filter actions, this will delete rows that fall out of the filter.
+    """
+    if not keep_ids:
+        cur.execute(f"DELETE FROM {table} WHERE {key_col} IS NOT NULL")
+        return cur.rowcount
 
-    # Determine whether the row exists
-    cursor.execute(f"SELECT 1 FROM {table} WHERE id = %s", (item_id,))
-    exists = cursor.fetchone()
-    if exists is None:
-        cursor.execute(
-            f"INSERT INTO {table} (id, name, action_detail, column_values) VALUES (%s, %s, %s, %s)",
-            (item_id, name, action_detail, Json(values_dict)),
+    keep_list = list(keep_ids)
+    deleted = 0
+    chunk = 1000
+
+    for i in range(0, len(keep_list), chunk):
+        part = keep_list[i:i + chunk]
+        placeholders = ", ".join(["%s"] * len(part))
+        cur.execute(
+            f"DELETE FROM {table} WHERE {key_col} IS NOT NULL AND {key_col} NOT IN ({placeholders})",
+            part
         )
-        return "insert"
+        deleted += cur.rowcount
+
+    return deleted
+
+
+# =============================================================================
+# FULL SYNC
+# =============================================================================
+def fetch_monday_items_for_sync() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (requests_items, actions_items)
+    Actions can be filtered by Assistant Generator if MONDAY_ACTIONS_ASSISTANT_COL_ID is set.
+    """
+    if not MONDAY_API_KEY:
+        raise RuntimeError("MONDAY_API_KEY is missing")
+
+    requests_items = query_monday_items(MONDAY_API_KEY, MONDAY_BOARD_REQUESTS_ID, limit=100)
+
+    if MONDAY_ACTIONS_ASSISTANT_COL_ID:
+        actions_items = query_monday_actions_filtered(
+            MONDAY_API_KEY,
+            MONDAY_BOARD_ACTIONS_ID,
+            MONDAY_ACTIONS_ASSISTANT_COL_ID,
+            MONDAY_ACTIONS_ASSISTANT_VALUE,
+            limit=100
+        )
     else:
-        cursor.execute(
-            f"UPDATE {table} SET name = %s, action_detail = %s, column_values = %s WHERE id = %s",
-            (name, action_detail, Json(values_dict), item_id),
-        )
-        return "update"
+        actions_items = query_monday_items(MONDAY_API_KEY, MONDAY_BOARD_ACTIONS_ID, limit=100)
 
-# ----------------------------------------------------------------------------
-# Periodic synchronisation
-# ----------------------------------------------------------------------------
+    return requests_items, actions_items
 
-def perform_sync_and_cleanup() -> Dict[str, Dict[str, int]]:
-    """Synchronise the monday.com boards with the database, including deletions.
 
-    This function performs the following steps:
-
-    1. Fetch all items from the configured requests and actions boards.
-    2. Upsert each item into the corresponding table (insert new rows or
-       update existing ones).
-    3. Identify any items that are present in the database but no longer
-       exist on the board and delete those rows.
-
-    A summary dictionary containing counts of inserts, updates and
-    deletions for each table is returned.  Any exceptions raised
-    during the process are propagated to the caller.
+def perform_full_sync() -> Dict[str, Any]:
     """
-    api_key = MONDAY_API_KEY or os.environ.get("MONDAY_API_KEY")
-    if not api_key:
-        raise RuntimeError("MONDAY_API_KEY env var not set")
+    1) Fetch monday items
+    2) Upsert into DB using element_id/action_id
+    3) Delete DB rows missing from monday using element_id/action_id
+    4) NEW: For actions, fill action_owner (email) from People column id multiple_person_mkv090pp
+    """
+    requests_items, actions_items = fetch_monday_items_for_sync()
 
-    board_requests_id = MONDAY_BOARD_REQUESTS_ID
-    board_actions_id = MONDAY_BOARD_ACTIONS_ID
-    table_requests = DB_TABLE_REQUESTS
-    table_actions = DB_TABLE_ACTIONS
-
-    # Fetch all items from both boards
-    items_requests = query_monday_items(api_key, board_requests_id)
-    items_actions = query_monday_items(api_key, board_actions_id)
-
-    summary: Dict[str, Dict[str, int]] = {
-        "requests": {"inserted": 0, "updated": 0, "deleted": 0},
-        "actions": {"inserted": 0, "updated": 0, "deleted": 0},
+    summary = {
+        "requests": {"inserted": 0, "updated": 0, "deleted": 0, "count_monday": len(requests_items)},
+        "actions": {"inserted": 0, "updated": 0, "deleted": 0, "count_monday": len(actions_items)},
     }
 
     conn = get_db_connection()
     try:
+        req_cols = get_table_columns(conn, DB_TABLE_REQUESTS)
+        act_cols = get_table_columns(conn, DB_TABLE_ACTIONS)
+
+        # -------------------------
+        # Pre-fetch ALL user emails used in Actions (efficient)
+        # -------------------------
+        all_people_ids: List[int] = []
+        for it in actions_items:
+            for cv in it.get("column_values", []) or []:
+                if cv.get("id") == MONDAY_ACTION_OWNER_COL_ID:
+                    all_people_ids += extract_people_ids_from_value(cv.get("value"))
+        emails_map = fetch_user_emails(MONDAY_API_KEY, all_people_ids)
+
         with conn:
             with conn.cursor() as cur:
-                # Synchronise requests items
-                new_ids_requests = set(int(item.get("id")) for item in items_requests)
-                # Upsert items
-                for item in items_requests:
-                    action = upsert_request_item(cur, table_requests, item)
-                    summary["requests"]["inserted" if action == "insert" else "updated"] += 1
-                # Delete rows that no longer exist on the board
-                cur.execute(f"SELECT id FROM {table_requests}")
-                existing_ids_requests = {row[0] for row in cur.fetchall()}
-                ids_to_delete = existing_ids_requests - new_ids_requests
-                for old_id in ids_to_delete:
-                    cur.execute(f"DELETE FROM {table_requests} WHERE id = %s", (old_id,))
-                    summary["requests"]["deleted"] += 1
+                # -------------------------
+                # Requests board -> subsidy_requests (key = element_id)
+                # -------------------------
+                request_ids: Set[int] = set()
+                for it in requests_items:
+                    mid = int(it["id"])
+                    request_ids.add(mid)
 
-                # Synchronise actions items
-                new_ids_actions = set(int(item.get("id")) for item in items_actions)
-                for item in items_actions:
-                    action2 = upsert_action_item(cur, table_actions, item)
-                    summary["actions"]["inserted" if action2 == "insert" else "updated"] += 1
-                cur.execute(f"SELECT id FROM {table_actions}")
-                existing_ids_actions = {row[0] for row in cur.fetchall()}
-                ids_to_delete_actions = existing_ids_actions - new_ids_actions
-                for old_id in ids_to_delete_actions:
-                    cur.execute(f"DELETE FROM {table_actions} WHERE id = %s", (old_id,))
-                    summary["actions"]["deleted"] += 1
+                    vals = map_item_to_db_values(
+                        it, req_cols, DB_KEY_REQUESTS, mid, is_actions_table=False
+                    )
+                    action = upsert_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, vals)
+
+                    if action == "insert":
+                        summary["requests"]["inserted"] += 1
+                    else:
+                        summary["requests"]["updated"] += 1
+
+                summary["requests"]["deleted"] = delete_missing_by_key(
+                    cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, request_ids
+                )
+
+                # -------------------------
+                # Actions board -> subsidy_action_plan (key = action_id)
+                # + NEW: action_owner = owner email
+                # -------------------------
+                action_ids: Set[int] = set()
+                for it in actions_items:
+                    mid = int(it["id"])
+                    action_ids.add(mid)
+
+                    vals = map_item_to_db_values(
+                        it, act_cols, DB_KEY_ACTIONS, mid, is_actions_table=True
+                    )
+
+                    # NEW: action_owner email from People column id multiple_person_mkv090pp
+                    # If multiple people, we take the first email (your requirement: "contient la valeur de son email").
+                    owner_email: Optional[str] = None
+                    for cv in it.get("column_values", []) or []:
+                        if cv.get("id") == MONDAY_ACTION_OWNER_COL_ID:
+                            person_ids = extract_people_ids_from_value(cv.get("value"))
+                            for pid in person_ids:
+                                em = (emails_map.get(pid) or "").strip()
+                                if em:
+                                    owner_email = em
+                                    break
+                        if owner_email:
+                            break
+
+                    if DB_ACTION_OWNER_COL in act_cols and owner_email:
+                        vals[DB_ACTION_OWNER_COL] = owner_email
+
+                    action = upsert_by_key(cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, vals)
+
+                    if action == "insert":
+                        summary["actions"]["inserted"] += 1
+                    else:
+                        summary["actions"]["updated"] += 1
+
+                summary["actions"]["deleted"] = delete_missing_by_key(
+                    cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, action_ids
+                )
+
     finally:
         conn.close()
+
     return summary
 
-# Background synchronisation thread
-def _sync_thread() -> None:
-    """Internal function run in a separate thread to perform periodic syncs."""
-    # Import here to avoid circular imports when this module is imported by others
-    import time
+
+# =============================================================================
+# POLLING THREAD
+# =============================================================================
+def _sync_loop():
     while True:
         try:
-            perform_sync_and_cleanup()
-        except Exception as exc:
-            # Print the exception rather than raising it, to keep the thread alive.
-            print(f"[sync_thread] Error during sync: {exc}")
-        # Sleep for the configured interval.  If interval is 0 or negative,
-        # exit the loop (which stops the thread).
-        interval = MONDAY_SYNC_INTERVAL
-        if interval <= 0:
-            break
-        time.sleep(interval)
+            s = perform_full_sync()
+            print("[sync_thread] Sync OK:", s, flush=True)
+        except Exception as e:
+            print(f"[sync_thread] Error during sync: {e}", flush=True)
+
+        time.sleep(max(MONDAY_SYNC_INTERVAL, 10))
 
 
-def start_periodic_sync() -> None:
-    """Start the periodic sync thread if MONDAY_SYNC_INTERVAL is positive."""
+def start_polling_if_enabled():
     if MONDAY_SYNC_INTERVAL > 0:
-        import threading
-        t = threading.Thread(target=_sync_thread, daemon=True)
+        t = threading.Thread(target=_sync_loop, daemon=True)
         t.start()
+        print(f"[sync_thread] Polling enabled every {MONDAY_SYNC_INTERVAL}s", flush=True)
 
 
-# ----------------------------------------------------------------------------
-# API endpoints
-# ----------------------------------------------------------------------------
+# =============================================================================
+# EMAIL FUNCTIONS
+# =============================================================================
+def send_email(to_email: str, subject: str, body_html: str) -> bool:
+    """
+    Send an email using the configured SMTP settings.
 
-@app.route('/')
+    Supports:
+      - SMTP AUTH (LOGIN) when enabled (typically smtp.office365.com:587 + STARTTLS)
+      - Optional fallback to an unauthenticated relay / "Direct Send" (typically <domain>.mail.protection.outlook.com:25)
+
+    Why this matters:
+      Microsoft 365 tenants often disable basic authentication for SMTP AUTH, which causes:
+      (535, '5.7.139 Authentication unsuccessful, basic authentication is disabled')
+      In that case, this function can automatically fall back to a no-auth relay (if configured).
+    """
+
+    def _email_domain(addr: str) -> str:
+        addr = (addr or "").strip().lower()
+        if "@" not in addr:
+            return ""
+        return addr.split("@", 1)[1]
+
+    def _is_internal_recipient(addr: str) -> bool:
+        if not SMTP_INTERNAL_DOMAINS:
+            return True  # nothing to validate against
+        return _email_domain(addr) in set(SMTP_INTERNAL_DOMAINS)
+
+    # Decide auth usage
+    server_host = (SMTP_SERVER or "").strip()
+    server_port = int(SMTP_PORT)
+
+    if not server_host:
+        print("[email] SMTP_SERVER is empty. Please set SMTP_SERVER in your environment.", flush=True)
+        return False
+
+    auth_mode = (SMTP_AUTH_MODE or "auto").strip().lower()
+    looks_like_o365_mx = "mail.protection.outlook.com" in server_host.lower()
+
+    if auth_mode in {"none", "no", "false", "0"}:
+        use_auth = False
+    elif auth_mode in {"login", "auth", "true", "1"}:
+        use_auth = True
+    else:
+        # auto
+        use_auth = bool(EMAIL_PASSWORD)
+        # Office 365 MX endpoints typically do not support AUTH
+        if server_port == 25 and looks_like_o365_mx:
+            use_auth = False
+
+    # Build message
+    msg = MIMEMultipart("alternative")
+    msg["From"] = EMAIL_USER or ""
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body_html, "html"))
+
+    def _smtp_send(host: str, port: int, *, do_auth: bool) -> None:
+        if not host:
+            raise RuntimeError("SMTP host is empty")
+
+        if not do_auth:
+            # Safety: prevent unauthenticated external sends by default
+            if not _is_internal_recipient(to_email):
+                raise RuntimeError(
+                    f"Refusing unauthenticated send to external domain: {to_email} (allowed: {SMTP_INTERNAL_DOMAINS})"
+                )
+
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.ehlo()
+
+            # STARTTLS: required on 587; optional elsewhere if offered.
+            want_starttls = (port == 587) or _env_bool("SMTP_USE_STARTTLS", True)
+            if want_starttls and server.has_extn("starttls"):
+                server.starttls()
+                server.ehlo()
+
+            if do_auth:
+                if not EMAIL_USER or not EMAIL_PASSWORD:
+                    raise RuntimeError("EMAIL_USER / EMAIL_PASSWORD not set for SMTP AUTH")
+                server.login(EMAIL_USER, EMAIL_PASSWORD)
+
+            server.send_message(msg)
+
+    # 1) Try primary server
+    try:
+        _smtp_send(server_host, server_port, do_auth=use_auth)
+        print(f"[email] Successfully sent to {to_email} via {server_host}:{server_port} (auth={use_auth})", flush=True)
+        return True
+
+    except smtplib.SMTPAuthenticationError as e:
+        err = str(e)
+        print(f"[email] SMTP AUTH failed via {server_host}:{server_port}: {err}", flush=True)
+
+        # If basic auth is disabled, retry with configured fallback (no-auth)
+        basic_auth_disabled = ("5.7.139" in err) or ("basic authentication is disabled" in err.lower())
+
+        if SMTP_ALLOW_NO_AUTH_FALLBACK and basic_auth_disabled:
+            fb_host = (SMTP_FALLBACK_SERVER or "").strip()
+            fb_port = int(SMTP_FALLBACK_PORT)
+
+            if fb_host and (fb_host != server_host or fb_port != server_port):
+                try:
+                    _smtp_send(fb_host, fb_port, do_auth=False)
+                    print(
+                        f"[email] Successfully sent to {to_email} via fallback {fb_host}:{fb_port} (auth=False)",
+                        flush=True,
+                    )
+                    return True
+                except Exception as e2:
+                    print(f"[email] Fallback send failed via {fb_host}:{fb_port}: {e2}", flush=True)
+
+        return False
+
+    except Exception as e:
+        print(f"[email] Failed to send to {to_email} via {server_host}:{server_port}: {e}", flush=True)
+        return False
+
+
+def get_late_actions() -> List[Dict[str, Any]]:
+    """
+    Fetch all actions with status='Late' from subsidy_action_plan.
+    Returns list of dicts with action details.
+    """
+    conn = get_db_connection()
+    try:
+        query = f"""
+        SELECT 
+            id,
+            name,
+            action_id,
+            item_link,
+            action_detail,
+            action_owner,
+            project_title,
+            status,
+            action_type,
+            due_date,
+            plant
+        FROM public.{DB_TABLE_ACTIONS}
+        WHERE status = 'Late' AND action_owner IS NOT NULL AND action_owner != ''
+        """
+        with conn.cursor() as cur:
+            cur.execute(query)
+            columns = [desc[0] for desc in cur.description]
+            rows = cur.fetchall()
+            return [dict(zip(columns, row)) for row in rows]
+    finally:
+        conn.close()
+
+
+def create_reminder_email_body(owner_email: str, actions: List[Dict[str, Any]]) -> str:
+    """
+    Create HTML email body in a single-list "follow-up" format (relance).
+    - owner_email: recipient email
+    - actions: list of late actions for that recipient
+    """
+
+    def _action_li(a: Dict[str, Any]) -> str:
+        name = (a.get("name") or "Untitled action").strip()
+        detail = (a.get("action_detail") or "").strip()
+        link = (a.get("item_link") or "").strip()
+
+        name_html = f'<a href="{link}" target="_blank" rel="noopener noreferrer">{name}</a>' if link else name
+        suffix = f" – {detail}" if detail else ""
+        return f"<li>{name_html}{suffix}</li>"
+
+    items_html = "\n".join(_action_li(a) for a in actions)
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <style>
+            body {{ font-family: Arial, sans-serif; line-height: 1.6; color: #333; }}
+            .container {{ max-width: 760px; margin: 0 auto; padding: 20px; }}
+            .header {{ background-color: #f3f4f6; border: 1px solid #e5e7eb; padding: 16px 20px; }}
+            .content {{ background-color: #ffffff; border: 1px solid #e5e7eb; border-top: none; padding: 20px; }}
+            ul {{ margin-top: 8px; }}
+            li {{ margin: 8px 0; }}
+            .hint {{ color: #6b7280; font-size: 12px; margin-top: 18px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <div style="font-size:16px; font-weight:bold;">Hello,</div>
+            </div>
+            <div class="content">
+                <p>
+                    Below is the list of <b>late subsidy actions</b> that require an update or follow-up from your side:
+                </p>
+
+                <ul>
+                    {items_html}
+                </ul>
+
+                <p>
+                    Please share a progress update or close the actions that are already completed.
+                </p>
+
+                <p>
+                    Best regards,<br/>
+                    AI Subsidy Assistant
+                </p>
+
+                <div class="hint">
+                    This is an automated reminder sent to {owner_email}. Please do not reply to this email.
+                </div>
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+
+
+def send_late_action_reminders() -> Dict[str, Any]:
+    """
+    Check for late actions and send reminder emails to action owners.
+    Sends **one email per owner** with a bullet list of late actions (relance format).
+    Returns summary of emails sent.
+    """
+    print("[cron] Starting weekly late action check...", flush=True)
+
+    try:
+        late_actions = get_late_actions()
+
+        if not late_actions:
+            print("[cron] No late actions found.", flush=True)
+            return {
+                "success": True,
+                "late_actions_count": 0,
+                "emails_sent": 0,
+                "emails_failed": 0,
+                "message": "No late actions found",
+            }
+
+        # Group late actions by owner email
+        actions_by_owner: Dict[str, List[Dict[str, Any]]] = {}
+        for action in late_actions:
+            owner_email = (action.get("action_owner") or "").strip()
+            if not owner_email:
+                print(f"[cron] Skipping action {action.get('action_id')} - no owner email", flush=True)
+                continue
+            actions_by_owner.setdefault(owner_email, []).append(action)
+
+        emails_sent = 0
+        emails_failed = 0
+
+        for owner_email, owner_actions in actions_by_owner.items():
+            subject = f"Follow-up required: {len(owner_actions)} late subsidy action(s)"
+            body = create_reminder_email_body(owner_email, owner_actions)
+
+            if send_email(owner_email, subject, body):
+                emails_sent += 1
+            else:
+                emails_failed += 1
+
+        return {
+            "success": True,
+            "late_actions_count": len(late_actions),
+            "owners_count": len(actions_by_owner),
+            "emails_sent": emails_sent,
+            "emails_failed": emails_failed,
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    except Exception as e:
+        print(f"[cron] Error during late action check: {e}", flush=True)
+        return {
+            "success": False,
+            "error": str(e),
+            "timestamp": datetime.now().isoformat(),
+        }
+
+
+
+# =============================================================================
+# SCHEDULER SETUP
+# =============================================================================
+def start_scheduler():
+    """
+    Start the background scheduler for weekly email reminders.
+
+    Controlled by .env:
+      - REMINDER_DAY_OF_WEEK (e.g. mon)
+      - REMINDER_HOUR (0-23)
+      - REMINDER_MINUTE (0-59)
+      - REMINDER_TIMEZONE (e.g. Africa/Tunis)
+    """
+    tz = REMINDER_TZINFO
+
+    scheduler = BackgroundScheduler(timezone=tz) if tz else BackgroundScheduler()
+
+    trigger = CronTrigger(
+        day_of_week=REMINDER_DAY_OF_WEEK,
+        hour=REMINDER_HOUR,
+        minute=REMINDER_MINUTE,
+        timezone=tz
+    )
+
+    scheduler.add_job(
+        func=send_late_action_reminders,
+        trigger=trigger,
+        id="weekly_late_action_check",
+        name="Weekly Late Action Reminder",
+        replace_existing=True,
+        coalesce=True,
+        misfire_grace_time=3600,  # 1 hour
+    )
+
+    scheduler.start()
+
+    tz_label = REMINDER_TIMEZONE if REMINDER_TIMEZONE else "local"
+    print(
+        f"[scheduler] Weekly reminder job scheduled: {REMINDER_DAY_OF_WEEK} at {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({tz_label})",
+        flush=True,
+    )
+
+    return scheduler
+
+
+# =============================================================================
+# KPI DATA FETCHERS
+# =============================================================================
+def get_subsidy_requests_data(connection) -> pd.DataFrame:
+    query = f"""
+    SELECT 
+        id,
+        name,
+        applicant_name,
+        site_location,
+        decision,
+        date_creation,
+        request_type,
+        estimated_budget,
+        subsidy_outcome,
+        amount_awarded,
+        date_of_subsidy_receipt
+    FROM public.{DB_TABLE_REQUESTS}
+    """
+    return pd.read_sql_query(query, connection)
+
+
+def get_action_plan_data(connection) -> pd.DataFrame:
+    query = f"""
+    SELECT 
+        id,
+        name,
+        action_id,
+        action_owner,
+        project_title,
+        status,
+        action_type,
+        initiation_date,
+        due_date,
+        plant,
+        expected_gain
+    FROM public.{DB_TABLE_ACTIONS}
+    """
+    return pd.read_sql_query(query, connection)
+
+
+def _clean_text(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.strip()
+
+
+# =============================================================================
+# KPI CALCULATIONS
+# =============================================================================
+def calculate_global_kpis(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict:
+    df = subsidy_requests.copy()
+    ap = action_plan.copy()
+
+    df["estimated_budget"] = pd.to_numeric(df.get("estimated_budget"), errors="coerce").fillna(0)
+    df["amount_awarded"] = pd.to_numeric(df.get("amount_awarded"), errors="coerce").fillna(0)
+
+    for col in ["request_type", "decision", "subsidy_outcome", "site_location"]:
+        if col in df.columns:
+            df[col] = _clean_text(df[col])
+
+    total_requests = len(df)
+    spontaneous_mask = df["request_type"].eq("Spontaneous requests") if "request_type" in df.columns else pd.Series([], dtype=bool)
+    planned_mask = df["request_type"].eq("Planned requests") if "request_type" in df.columns else pd.Series([], dtype=bool)
+    validated_mask = df["decision"].isin(["Validate all subventions", "Validate some subventions"]) if "decision" in df.columns else pd.Series([], dtype=bool)
+    any_answer_mask = df["decision"].notna() if "decision" in df.columns else pd.Series([], dtype=bool)
+    won_mask = df["subsidy_outcome"].eq("Won") if "subsidy_outcome" in df.columns else pd.Series([], dtype=bool)
+    in_progress_mask = df["decision"].isna() if "decision" in df.columns else pd.Series([], dtype=bool)
+
+    kpis = {}
+    kpis["nombre_demandes_spontanees"] = int(spontaneous_mask.sum())
+    kpis["montants_en_cours"] = float(df.loc[in_progress_mask, "estimated_budget"].sum()) if "estimated_budget" in df.columns else 0.0
+    kpis["nombre_demandes_validees"] = int(validated_mask.sum())
+    kpis["montants_obtenus"] = float(df["amount_awarded"].sum()) if "amount_awarded" in df.columns else 0.0
+
+    kpis["actions_realisees"] = int((ap["status"] == "Completed").sum()) if "status" in ap.columns else 0
+    kpis["actions_en_retard"] = int((ap["status"] == "Late").sum()) if "status" in ap.columns else 0
+
+    kpis["plant_requests"] = int(planned_mask.sum())
+    denom_validated = max(int(validated_mask.sum()), 1)
+    kpis["success_rate_validated"] = float((won_mask & validated_mask).sum() / denom_validated * 100)
+    kpis["success_rate_submitted_alt"] = float(validated_mask.sum() / max(total_requests, 1) * 100)
+
+    total_est = float(df["estimated_budget"].sum()) if "estimated_budget" in df.columns else 0.0
+    total_awd = float(df["amount_awarded"].sum()) if "amount_awarded" in df.columns else 0.0
+    kpis["impact_competitiveness"] = float((total_awd / total_est * 100) if total_est > 0 else 0.0)
+
+    kpis["percent_positive_answers"] = float(validated_mask.sum() / max(total_requests, 1) * 100)
+    kpis["percent_any_answer_alt"] = float(any_answer_mask.sum() / max(total_requests, 1) * 100)
+
+    return kpis
+
+
+def calculate_kpis_by_site(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> pd.DataFrame:
+    df = subsidy_requests.copy()
+    ap = action_plan.copy()
+
+    df["estimated_budget"] = pd.to_numeric(df.get("estimated_budget"), errors="coerce").fillna(0)
+    df["amount_awarded"] = pd.to_numeric(df.get("amount_awarded"), errors="coerce").fillna(0)
+
+    for col in ["request_type", "decision", "subsidy_outcome", "site_location"]:
+        if col in df.columns:
+            df[col] = _clean_text(df[col])
+    if "plant" in ap.columns:
+        ap["plant"] = _clean_text(ap["plant"])
+
+    sites = sorted(set(df.get("site_location", pd.Series([])).dropna().unique()) | set(ap.get("plant", pd.Series([])).dropna().unique()))
+    rows: List[Dict] = []
+
+    for site in sites:
+        site_req = df[df["site_location"] == site] if "site_location" in df.columns else df.iloc[0:0]
+        site_ap = ap[ap["plant"] == site] if "plant" in ap.columns else ap.iloc[0:0]
+
+        total = len(site_req)
+        spontaneous_mask = site_req["request_type"].eq("Spontaneous requests") if "request_type" in site_req.columns else pd.Series([], dtype=bool)
+        planned_mask = site_req["request_type"].eq("Planned requests") if "request_type" in site_req.columns else pd.Series([], dtype=bool)
+        validated_mask = site_req["decision"].isin(["Validate all subventions", "Validate some subventions"]) if "decision" in site_req.columns else pd.Series([], dtype=bool)
+        won_mask = site_req["subsidy_outcome"].eq("Won") if "subsidy_outcome" in site_req.columns else pd.Series([], dtype=bool)
+        in_progress_mask = site_req["decision"].isna() if "decision" in site_req.columns else pd.Series([], dtype=bool)
+
+        est_sum = float(site_req["estimated_budget"].sum()) if "estimated_budget" in site_req.columns else 0.0
+        awd_sum = float(site_req["amount_awarded"].sum()) if "amount_awarded" in site_req.columns else 0.0
+
+        completed = int((site_ap["status"] == "Completed").sum()) if "status" in site_ap.columns else 0
+        late = int((site_ap["status"] == "Late").sum()) if "status" in site_ap.columns else 0
+
+        row = {
+            "Site": site,
+            "Demandes spontanées": int(spontaneous_mask.sum()),
+            "Montants en cours (€)": float(site_req.loc[in_progress_mask, "estimated_budget"].sum()) if "estimated_budget" in site_req.columns else 0.0,
+            "Demandes validées": int(validated_mask.sum()),
+            "Montants obtenus (€)": awd_sum,
+            "Actions réalisées": completed,
+            "Actions en retard": late,
+            "Plant Requests": int(planned_mask.sum()),
+            "Success Rate (validated)%": float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
+            "Percent Positive Answers%": float(validated_mask.sum() / max(total, 1) * 100),
+            "Impact on Competitiveness%": float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def calculate_kpis_by_project(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> pd.DataFrame:
+    df = subsidy_requests.copy()
+    ap = action_plan.copy()
+
+    df["estimated_budget"] = pd.to_numeric(df.get("estimated_budget"), errors="coerce").fillna(0)
+    df["amount_awarded"] = pd.to_numeric(df.get("amount_awarded"), errors="coerce").fillna(0)
+
+    for col in ["request_type", "decision", "subsidy_outcome", "site_location"]:
+        if col in df.columns:
+            df[col] = _clean_text(df[col])
+    for col in ["project_title", "plant", "status"]:
+        if col in ap.columns:
+            ap[col] = _clean_text(ap[col])
+
+    projects = sorted(ap.get("project_title", pd.Series([])).dropna().unique())
+    rows: List[Dict] = []
+
+    for project in projects:
+        proj_actions = ap[ap["project_title"] == project] if "project_title" in ap.columns else ap.iloc[0:0]
+        site = proj_actions["plant"].mode()[0] if ("plant" in proj_actions.columns and not proj_actions["plant"].mode().empty) else "N/A"
+        proj_reqs = df[df["site_location"] == site] if (site != "N/A" and "site_location" in df.columns) else df.iloc[0:0]
+
+        total = len(proj_reqs)
+        spontaneous_mask = proj_reqs["request_type"].eq("Spontaneous requests") if "request_type" in proj_reqs.columns else pd.Series([], dtype=bool)
+        planned_mask = proj_reqs["request_type"].eq("Planned requests") if "request_type" in proj_reqs.columns else pd.Series([], dtype=bool)
+        validated_mask = proj_reqs["decision"].isin(["Validate all subventions", "Validate some subventions"]) if "decision" in proj_reqs.columns else pd.Series([], dtype=bool)
+        won_mask = proj_reqs["subsidy_outcome"].eq("Won") if "subsidy_outcome" in proj_reqs.columns else pd.Series([], dtype=bool)
+        in_progress_mask = proj_reqs["decision"].isna() if "decision" in proj_reqs.columns else pd.Series([], dtype=bool)
+
+        est_sum = float(proj_reqs["estimated_budget"].sum()) if "estimated_budget" in proj_reqs.columns else 0.0
+        awd_sum = float(proj_reqs["amount_awarded"].sum()) if "amount_awarded" in proj_reqs.columns else 0.0
+
+        completed = int((proj_actions["status"] == "Completed").sum()) if "status" in proj_actions.columns else 0
+        late = int((proj_actions["status"] == "Late").sum()) if "status" in proj_actions.columns else 0
+
+        row = {
+            "Projet": project,
+            "Site": site,
+            "Demandes spontanées": int(spontaneous_mask.sum()),
+            "Montants en cours (€)": float(proj_reqs.loc[in_progress_mask, "estimated_budget"].sum()) if "estimated_budget" in proj_reqs.columns else 0.0,
+            "Demandes validées": int(validated_mask.sum()),
+            "Montants obtenus (€)": awd_sum,
+            "Actions réalisées": completed,
+            "Actions en retard": late,
+            "Plant Requests": int(planned_mask.sum()),
+            "Success Rate (validated)%": float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
+            "Percent Positive Answers%": float(validated_mask.sum() / max(total, 1) * 100),
+            "Impact on Competitiveness%": float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def get_detailed_data_for_visualization(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    viz_data = {}
+    viz_data["requests_summary"] = subsidy_requests[
+        ["name", "site_location", "request_type", "decision", "estimated_budget", "amount_awarded", "date_creation"]
+    ].copy()
+
+    viz_data["actions_summary"] = action_plan[
+        ["project_title", "plant", "status", "action_type", "initiation_date", "due_date", "expected_gain"]
+    ].copy()
+    return viz_data
+
+
+# =============================================================================
+# API Routes
+# =============================================================================
+@app.route("/")
 def home():
-    """Return a description of the API and available endpoints."""
     return jsonify({
-        "message": "Subsidy KPI and Monday Sync API",
-        "version": "1.2",
+        "message": "Subsidy KPI API + Monday Polling Sync (with action_owner email) + Weekly Reminders",
+        "version": "5.0",
+        "polling_interval_seconds": MONDAY_SYNC_INTERVAL,
+        "email_reminders": {
+            "enabled": True,
+            "schedule": "Every Monday at 9:00 AM",
+            "smtp_server": SMTP_SERVER,
+            "from_email": EMAIL_USER
+        },
+        "actions_filter": {
+            "enabled": bool(MONDAY_ACTIONS_ASSISTANT_COL_ID),
+            "column_id": MONDAY_ACTIONS_ASSISTANT_COL_ID,
+            "value": MONDAY_ACTIONS_ASSISTANT_VALUE,
+        },
+        "action_owner_mapping": {
+            "monday_col_id": MONDAY_ACTION_OWNER_COL_ID,
+            "db_column": DB_ACTION_OWNER_COL,
+            "note": "If multiple people are assigned, the first email found is stored.",
+        },
+        "db_keys": {
+            "requests_key": f"{DB_TABLE_REQUESTS}.{DB_KEY_REQUESTS}",
+            "actions_key": f"{DB_TABLE_ACTIONS}.{DB_KEY_ACTIONS}",
+        },
         "endpoints": {
-            "/api/kpis/global": "GET – Global KPI metrics",
-            "/api/kpis/by-site": "GET – KPI metrics grouped by site",
-            "/api/kpis/by-project": "GET – KPI metrics grouped by project",
-            "/api/kpis/all": "GET – All KPI metrics combined",
-            "/api/data/requests": "GET – Raw subsidy requests data",
-            "/api/data/actions": "GET – Raw action plan data",
-            "/api/data/visualization": "GET – Simplified data for charts",
-            "/health": "GET – Health check for the service",
-            "/sync": "GET/POST – Manually synchronise monday.com boards",
-            "/webhook": "POST – Receive webhook events from monday.com"
+            "/health": "GET - Health check",
+            "/sync": "GET/POST - Manual full sync (insert/update/delete)",
+            "/send-reminders": "GET/POST - Manual trigger for late action reminders",
+            "/api/kpis/global": "GET - Global KPIs",
+            "/api/kpis/by-site": "GET - KPIs by site",
+            "/api/kpis/by-project": "GET - KPIs by project",
+            "/api/kpis/all": "GET - All KPIs combined",
+            "/api/data/requests": "GET - Subsidy requests data",
+            "/api/data/actions": "GET - Action plan data",
+            "/api/data/visualization": "GET - Data for visualization",
         }
     })
 
 
-@app.route('/api/kpis/global', methods=['GET'])
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/sync", methods=["GET", "POST"])
+def sync_now():
+    try:
+        s = perform_full_sync()
+        return jsonify({"success": True, "data": s}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/send-reminders", methods=["GET", "POST"])
+def trigger_reminders():
+    """
+    Manual endpoint to trigger late action reminder emails.
+    Useful for testing or manual execution.
+    """
+    try:
+        result = send_late_action_reminders()
+        return jsonify(result), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/kpis/global", methods=["GET"])
 def get_global_kpis():
-    """Endpoint to compute global KPI metrics."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
+
         kpis = calculate_global_kpis(subsidy_requests, action_plan)
         return jsonify({"success": True, "data": kpis})
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/kpis/by-site', methods=['GET'])
-def get_kpis_by_site_route():
-    """Endpoint to compute KPI metrics by site."""
+@app.route("/api/kpis/by-site", methods=["GET"])
+def get_kpis_by_site():
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
+
         kpis_df = calculate_kpis_by_site(subsidy_requests, action_plan)
-        return jsonify({"success": True, "data": kpis_df.to_dict(orient='records')})
-    except Exception as e:  # pylint: disable=broad-except
+        return jsonify({"success": True, "data": kpis_df.to_dict(orient="records")})
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/kpis/by-project', methods=['GET'])
-def get_kpis_by_project_route():
-    """Endpoint to compute KPI metrics by project."""
+@app.route("/api/kpis/by-project", methods=["GET"])
+def get_kpis_by_project():
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
+
         kpis_df = calculate_kpis_by_project(subsidy_requests, action_plan)
-        return jsonify({"success": True, "data": kpis_df.to_dict(orient='records')})
-    except Exception as e:  # pylint: disable=broad-except
+        return jsonify({"success": True, "data": kpis_df.to_dict(orient="records")})
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/kpis/all', methods=['GET'])
-def get_all_kpis_route():
-    """Endpoint to return all KPI metrics (global, by site and by project)."""
+@app.route("/api/kpis/all", methods=["GET"])
+def get_all_kpis():
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
+
         global_kpis = calculate_global_kpis(subsidy_requests, action_plan)
         kpis_by_site = calculate_kpis_by_site(subsidy_requests, action_plan)
         kpis_by_project = calculate_kpis_by_project(subsidy_requests, action_plan)
+
         return jsonify({
             "success": True,
             "data": {
                 "global": global_kpis,
-                "by_site": kpis_by_site.to_dict(orient='records'),
-                "by_project": kpis_by_project.to_dict(orient='records'),
-            },
+                "by_site": kpis_by_site.to_dict(orient="records"),
+                "by_project": kpis_by_project.to_dict(orient="records"),
+            }
         })
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/data/requests', methods=['GET'])
+@app.route("/api/data/requests", methods=["GET"])
 def get_requests_data():
-    """Endpoint to fetch raw subsidy request records."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         conn.close()
-        data = json.loads(subsidy_requests.to_json(orient='records', date_format='iso'))
+
+        data = json.loads(subsidy_requests.to_json(orient="records", date_format="iso"))
         return jsonify({"success": True, "count": len(data), "data": data})
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/data/actions', methods=['GET'])
+@app.route("/api/data/actions", methods=["GET"])
 def get_actions_data():
-    """Endpoint to fetch raw action plan records."""
     try:
         conn = get_db_connection()
         action_plan = get_action_plan_data(conn)
         conn.close()
-        data = json.loads(action_plan.to_json(orient='records', date_format='iso'))
+
+        data = json.loads(action_plan.to_json(orient="records", date_format="iso"))
         return jsonify({"success": True, "count": len(data), "data": data})
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/api/data/visualization', methods=['GET'])
+@app.route("/api/data/visualization", methods=["GET"])
 def get_visualization_data():
-    """Endpoint to return simplified data for visualisation purposes."""
     try:
         conn = get_db_connection()
         subsidy_requests = get_subsidy_requests_data(conn)
         action_plan = get_action_plan_data(conn)
         conn.close()
+
         viz_data = get_detailed_data_for_visualization(subsidy_requests, action_plan)
         return jsonify({
             "success": True,
             "data": {
-                "requests_summary": json.loads(viz_data['requests_summary'].to_json(orient='records', date_format='iso')),
-                "actions_summary": json.loads(viz_data['actions_summary'].to_json(orient='records', date_format='iso')),
-            },
+                "requests_summary": json.loads(viz_data["requests_summary"].to_json(orient="records", date_format="iso")),
+                "actions_summary": json.loads(viz_data["actions_summary"].to_json(orient="records", date_format="iso")),
+            }
         })
-    except Exception as e:  # pylint: disable=broad-except
+    except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Simple health check endpoint."""
-    return jsonify({"status": "ok"}), 200
-
-
-@app.route('/sync', methods=['GET', 'POST'])
-def sync_boards():
-    """Synchronise the configured monday.com boards with the database."""
-    api_key = MONDAY_API_KEY or os.environ.get("MONDAY_API_KEY")
-    if not api_key:
-        return jsonify({"error": "MONDAY_API_KEY env var not set"}), 500
-
-    board_requests_id = MONDAY_BOARD_REQUESTS_ID
-    board_actions_id = MONDAY_BOARD_ACTIONS_ID
-    table_requests = DB_TABLE_REQUESTS
-    table_actions = DB_TABLE_ACTIONS
-
-    # Fetch all items from both boards
-    try:
-        items_requests = query_monday_items(api_key, board_requests_id)
-        items_actions = query_monday_items(api_key, board_actions_id)
-    except Exception as exc:  # pylint: disable=broad-except
-        return jsonify({"error": f"Failed to fetch items: {exc}"}), 500
-
-    inserted_requests = updated_requests = 0
-    inserted_actions = updated_actions = 0
-    try:
-        conn = get_db_connection()
-    except Exception as exc:  # pylint: disable=broad-except
-        return jsonify({"error": f"Database connection error: {exc}"}), 500
-
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                # Upsert request items
-                for item in items_requests:
-                    action = upsert_request_item(cur, table_requests, item)
-                    if action == "insert":
-                        inserted_requests += 1
-                    else:
-                        updated_requests += 1
-                # Upsert action items
-                for item in items_actions:
-                    action2 = upsert_action_item(cur, table_actions, item)
-                    if action2 == "insert":
-                        inserted_actions += 1
-                    else:
-                        updated_actions += 1
-    finally:
-        conn.close()
-
-    return jsonify({
-        "status": "success",
-        "requests": {"inserted": inserted_requests, "updated": updated_requests},
-        "actions": {"inserted": inserted_actions, "updated": updated_actions},
-    }), 200
-
-
-@app.route('/webhook', methods=['POST'])
-def monday_webhook():
-    """Handle incoming webhook events from monday.com."""
-    try:
-        payload = request.get_json(force=True)
-    except Exception:
-        return jsonify({"error": "Invalid JSON"}), 400
-
-    # Verification challenge
-    if payload and isinstance(payload, dict) and "challenge" in payload:
-        return jsonify({"challenge": payload["challenge"]}), 200
-
-    event = payload.get("event") if payload else None
-    if not event:
-        return jsonify({"error": "Missing event in webhook payload"}), 400
-
-    event_type = event.get("type")
-    board_id = event.get("boardId") or event.get("board_id")
-    item_id = event.get("pulseId") or event.get("itemId") or event.get("item_id")
-    if not board_id or not item_id:
-        return jsonify({"error": "Webhook event missing board or item ID"}), 400
-
-    try:
-        board_id_int = int(board_id)
-        item_id_int = int(item_id)
-    except ValueError:
-        return jsonify({"error": "Invalid board or item ID"}), 400
-
-    api_key = MONDAY_API_KEY or os.environ.get("MONDAY_API_KEY")
-    if not api_key:
-        return jsonify({"error": "MONDAY_API_KEY env var not set"}), 500
-
-    board_requests_id = MONDAY_BOARD_REQUESTS_ID
-    board_actions_id = MONDAY_BOARD_ACTIONS_ID
-    target: Optional[str] = None
-    if board_id_int == board_requests_id:
-        target = "requests"
-    elif board_id_int == board_actions_id:
-        target = "actions"
-    else:
-        # Unrecognised board; ignore
-        return jsonify({"status": "ignored", "reason": "Event from unconfigured board"}), 200
-
-    table_requests = DB_TABLE_REQUESTS
-    table_actions = DB_TABLE_ACTIONS
-    table_name = table_requests if target == "requests" else table_actions
-
-    # Deletion event: remove row from database
-    if event_type == "delete_pulse":
-        try:
-            conn = get_db_connection()
-        except Exception as exc:  # pylint: disable=broad-except
-            return jsonify({"error": f"Database connection error: {exc}"}), 500
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(f"DELETE FROM {table_name} WHERE id = %s", (item_id_int,))
-                    deleted = cur.rowcount > 0
-        finally:
-            conn.close()
-        return jsonify({
-            "status": "success",
-            "target": target,
-            "action": "delete",
-            "deleted": deleted,
-            "board_id": board_id_int,
-            "item_id": item_id_int,
-        }), 200
-
-    # For creation or update events: fetch the item and upsert
-    try:
-        item = query_monday_item(api_key, board_id_int, item_id_int)
-        if item is None:
-            return jsonify({"status": "ignored", "reason": "Item not found"}), 200
-    except Exception as exc:  # pylint: disable=broad-except
-        return jsonify({"error": f"Failed to fetch item: {exc}"}), 500
-
-    try:
-        conn = get_db_connection()
-    except Exception as exc:  # pylint: disable=broad-except
-        return jsonify({"error": f"Database connection error: {exc}"}), 500
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                if target == "requests":
-                    action = upsert_request_item(cur, table_name, item)
-                else:
-                    action = upsert_action_item(cur, table_name, item)
-    finally:
-        conn.close()
-    return jsonify({
-        "status": "success",
-        "target": target,
-        "action": action,
-        "board_id": board_id_int,
-        "item_id": item_id_int,
-    }), 200
-
-
-# ----------------------------------------------------------------------------
-# Error handlers
-# ----------------------------------------------------------------------------
-
 @app.errorhandler(404)
-def not_found(error):
+def not_found(_):
     return jsonify({"success": False, "error": "Endpoint not found"}), 404
 
 
 @app.errorhandler(500)
-def internal_error(error):  # pylint: disable=unused-argument
+def internal_error(_):
     return jsonify({"success": False, "error": "Internal server error"}), 500
 
 
-if __name__ == '__main__':
-    # When executed directly, run the Flask development server.  In
-    # production, this application should be run by a WSGI server such
-    # as Gunicorn.  The host is bound to 0.0.0.0 to allow external
-    # connectivity from Docker or other containers.
-    # Optionally start periodic synchronisation before running the server.
-    start_periodic_sync()
-    port = int(os.environ.get("FLASK_RUN_PORT", "5000"))
-    app.run(debug=True, host='0.0.0.0', port=port)
+# =============================================================================
+# Run
+# =============================================================================
+if __name__ == "__main__":
+    # Runtime flags (configurable via env)
+    DEBUG = _env_bool("FLASK_DEBUG", _env_bool("DEBUG", True))
+    USE_RELOADER = _env_bool("USE_RELOADER", DEBUG)
+
+    HOST = _first_env(["FLASK_RUN_HOST"], "0.0.0.0")
+    PORT = int(_first_env(["PORT", "FLASK_RUN_PORT"], "5000"))
+
+    def _should_start_background_jobs() -> bool:
+        # When Flask reloader is enabled, the app starts twice.
+        # Only run background threads/schedulers in the reloader child process.
+        if not USE_RELOADER:
+            return True
+        return os.environ.get("WERKZEUG_RUN_MAIN") == "true"
+
+    scheduler = None
+
+    if _should_start_background_jobs():
+        # Start Monday.com polling if enabled
+        start_polling_if_enabled()
+
+        # Start the scheduler for weekly email reminders
+        scheduler = start_scheduler()
+    else:
+        print("[app] Flask reloader parent process: background jobs not started.", flush=True)
+
+    try:
+        app.run(debug=DEBUG, host=HOST, port=PORT, use_reloader=USE_RELOADER)
+    except (KeyboardInterrupt, SystemExit):
+        if scheduler:
+            try:
+                scheduler.shutdown()
+            except Exception:
+                pass
+        print("[app] Shutting down gracefully...", flush=True)
