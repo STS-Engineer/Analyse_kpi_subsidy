@@ -123,9 +123,9 @@ DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")
 
 # Polling interval (seconds). Safer default is OFF unless explicitly set.
 MONDAY_SYNC_INTERVAL = 600
-# Optional filter for actions board
+# Always filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
 MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "").strip()
-MONDAY_ACTIONS_ASSISTANT_VALUE = _first_env(["MONDAY_ACTIONS_ASSISTANT_VALUE"], "AI Subsidy Assistant").strip()
+MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"  # mandatory fixed value
 
 # Owner mapping
 MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multiple_person_mkv090pp").strip()
@@ -443,23 +443,31 @@ def delete_missing_by_key(cur, table: str, key_col: str, keep_ids: Set[int]) -> 
 # FULL SYNC
 # =============================================================================
 def fetch_monday_items_for_sync() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Returns (requests_items, actions_items)
+    Actions are ALWAYS filtered by Assistant Generator == "AI Subsidy Assistant".
+    """
     if not MONDAY_API_KEY:
         raise RuntimeError("MONDAY_API_KEY is missing")
 
+    if not MONDAY_ACTIONS_ASSISTANT_COL_ID:
+        raise RuntimeError(
+            "MONDAY_ACTIONS_ASSISTANT_COL_ID is required. "
+            "Set it to the monday column ID for 'Assistant Generator'."
+        )
+
     requests_items = query_monday_items(MONDAY_API_KEY, MONDAY_BOARD_REQUESTS_ID, limit=100)
 
-    if MONDAY_ACTIONS_ASSISTANT_COL_ID:
-        actions_items = query_monday_actions_filtered(
-            MONDAY_API_KEY,
-            MONDAY_BOARD_ACTIONS_ID,
-            MONDAY_ACTIONS_ASSISTANT_COL_ID,
-            MONDAY_ACTIONS_ASSISTANT_VALUE,
-            limit=100
-        )
-    else:
-        actions_items = query_monday_items(MONDAY_API_KEY, MONDAY_BOARD_ACTIONS_ID, limit=100)
+    actions_items = query_monday_actions_filtered(
+        MONDAY_API_KEY,
+        MONDAY_BOARD_ACTIONS_ID,
+        MONDAY_ACTIONS_ASSISTANT_COL_ID,
+        MONDAY_ACTIONS_ASSISTANT_VALUE,
+        limit=100
+    )
 
     return requests_items, actions_items
+
 
 
 def perform_full_sync() -> Dict[str, Any]:
