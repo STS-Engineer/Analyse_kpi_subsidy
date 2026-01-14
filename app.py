@@ -24,8 +24,67 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # =============================================================================
-# Remove .env loading since we're hardcoding values
+# Load .env (optional)
 # =============================================================================
+def _load_dotenv_if_present() -> None:
+    """Load environment variables from a .env file if present.
+
+    - Uses python-dotenv if installed.
+    - Falls back to a minimal KEY=VALUE parser.
+    """
+    # 1) python-dotenv (best)
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv(override=False)
+        return
+    except Exception:
+        pass
+
+    # 2) minimal fallback parser
+    preexisting = set(os.environ.keys())
+
+    candidates: List[str] = []
+    try:
+        candidates.append(os.path.join(os.getcwd(), ".env"))
+    except Exception:
+        pass
+    try:
+        candidates.append(os.path.join(os.path.dirname(__file__), ".env"))
+    except Exception:
+        pass
+
+    for env_path in candidates:
+        if not env_path or not os.path.isfile(env_path):
+            continue
+        try:
+            parsed: Dict[str, str] = {}
+            with open(env_path, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, val = line.split("=", 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if not key:
+                        continue
+                    # remove surrounding quotes
+                    if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
+                        val = val[1:-1]
+                    # last definition wins within the .env file
+                    parsed[key] = val
+
+            for k, v in parsed.items():
+                if k not in preexisting:
+                    os.environ[k] = v
+        except Exception:
+            # best-effort: never crash startup because of .env parsing
+            pass
+
+
+_load_dotenv_if_present()
+
+
 def _first_env(keys: List[str], default: str = "") -> str:
     """Return the first non-empty environment variable among keys."""
     for k in keys:
@@ -75,77 +134,81 @@ app = Flask(__name__)
 CORS(app)
 
 # =============================================================================
-# HARDCODED CONFIG (replacing environment variables)
+# CONFIG
 # =============================================================================
 
-# PostgreSQL settings
+# PostgreSQL settings (supports both PG* and DB_* env names)
 DB_CONFIG = {
-    "host": "avo-adb-002.postgres.database.azure.com",
-    "database": "Subsidy_DB",
-    "user": "administrationSTS",
-    "password": "St$@0987",
-    "port": 5432,
-    "sslmode": "require",
+    "host": _first_env(["PGHOST", "DB_HOST"], "avo-adb-002.postgres.database.azure.com"),
+    "database": _first_env(["PGDATABASE", "DB_NAME"], "Subsidy_DB"),
+    "user": _first_env(["PGUSER", "DB_USER"], "administrationSTS"),
+    "password": _first_env(["PGPASSWORD", "DB_PASSWORD"], ""),
+    "port": int(_first_env(["PGPORT", "DB_PORT"], "5432")),
+    "sslmode": _first_env(["PGSSLMODE"], "require"),
 }
 
-# Email settings (SMTP RELAY configuration)
-SMTP_SERVER = "avocarbon-com.mail.protection.outlook.com"
-SMTP_PORT = 25
-EMAIL_USER = "administration.STS@avocarbon.com"
-EMAIL_PASSWORD = ""  # No password needed for relay
+# Email settings
+SMTP_SERVER = _first_env(["SMTP_SERVER", "EMAIL_HOST"], "")
+SMTP_PORT = int(_first_env(["SMTP_PORT", "EMAIL_PORT"], "587"))
+EMAIL_USER = _first_env(["EMAIL_USER"], "")
+EMAIL_PASSWORD = _first_env(["EMAIL_PASSWORD", "EMAIL_PASS"], "")
 
 # Optional unauthenticated fallback (Direct Send / SMTP relay on port 25)
-SMTP_FALLBACK_SERVER = "avocarbon-com.mail.protection.outlook.com"
-SMTP_FALLBACK_PORT = 25
-SMTP_AUTH_MODE = "none"  # auto | login | none
-SMTP_ALLOW_NO_AUTH_FALLBACK = True
+SMTP_FALLBACK_SERVER = _first_env(["SMTP_FALLBACK_SERVER", "EMAIL_HOST"], "")
+SMTP_FALLBACK_PORT = int(_first_env(["SMTP_FALLBACK_PORT", "EMAIL_PORT"], "25"))
+SMTP_AUTH_MODE = _first_env(["SMTP_AUTH_MODE"], "auto").lower()  # auto | login | none
+SMTP_ALLOW_NO_AUTH_FALLBACK = _env_bool("SMTP_ALLOW_NO_AUTH_FALLBACK", True)
 
-# Restrict unauthenticated sends to internal domains
-SMTP_INTERNAL_DOMAINS = ["avocarbon.com"]
+# Restrict unauthenticated sends to internal domains (recommended)
+SMTP_INTERNAL_DOMAINS = [
+    d.strip().lower()
+    for d in _first_env(["SMTP_INTERNAL_DOMAINS"], "").split(",")
+    if d.strip()
+]
+if not SMTP_INTERNAL_DOMAINS and "@" in EMAIL_USER:
+    SMTP_INTERNAL_DOMAINS = [EMAIL_USER.split("@", 1)[1].lower()]
 
 # monday.com settings
-MONDAY_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzNzU5MzQ0NywiYWFpIjoxMSwidWlkIjo3NjQ5MDYwMiwiaWFkIjoiMjAyNS0wNy0xMFQxNTo0Mzo0OS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.MhRXxTDVZlx2FSnPii_PZ8dD39Q_kCdZXsrEjOCt4i4"
-MONDAY_BOARD_REQUESTS_ID = 9612741617
-MONDAY_BOARD_ACTIONS_ID = 9366723818
+MONDAY_API_KEY = _first_env(["MONDAY_API_KEY"], "")
+MONDAY_BOARD_REQUESTS_ID = int(_first_env(["MONDAY_BOARD_REQUESTS_ID"], "9612741617"))
+MONDAY_BOARD_ACTIONS_ID = int(_first_env(["MONDAY_BOARD_ACTIONS_ID"], "9366723818"))
 
 # monday.com base URL (used to build clickable item links)
-MONDAY_BASE_URL = "https://avocarbon.monday.com"
+MONDAY_BASE_URL = _first_env(["MONDAY_BASE_URL"], "https://avocarbon.monday.com")
 
 # monday.com column IDs (actions board)
-MONDAY_ACTION_ITEM_ID_COL_ID = "pulse_id_mkzk18n7"
-MONDAY_ACTION_DETAIL_COL_ID = ""  # Empty as in .env
+# "Identifiant de l'élément" (type item_id)
+MONDAY_ACTION_ITEM_ID_COL_ID = _first_env(["MONDAY_ACTION_ITEM_ID_COL_ID"], "pulse_id_mkzk18n7")
+# "Action détaillé" (set this env var to the exact monday column id)
+MONDAY_ACTION_DETAIL_COL_ID = _first_env(["MONDAY_ACTION_DETAIL_COL_ID"], "").strip()
 
 # Tables
-DB_TABLE_REQUESTS = "subsidy_requests"
-DB_TABLE_ACTIONS = "subsidy_action_plan"
+DB_TABLE_REQUESTS = _first_env(["DB_TABLE_REQUESTS"], "subsidy_requests")
+DB_TABLE_ACTIONS = _first_env(["DB_TABLE_ACTIONS"], "subsidy_action_plan")
 
 # External keys (monday item ID stored here)
-DB_KEY_REQUESTS = "element_id"  # subsidy_requests.element_id
-DB_KEY_ACTIONS = "action_id"     # subsidy_action_plan.action_id
+DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")  # subsidy_requests.element_id
+DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")     # subsidy_action_plan.action_id
 
 # Polling interval (seconds)
-MONDAY_SYNC_INTERVAL = 300
+MONDAY_SYNC_INTERVAL = int(_first_env(["MONDAY_SYNC_INTERVAL"], "0"))
 
-# Filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
-MONDAY_ACTIONS_ASSISTANT_COL_ID = "text_mks2y5v7"
-MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"
+# Optional: filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
+# You MUST provide the column ID (not the title).
+MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "").strip()
+MONDAY_ACTIONS_ASSISTANT_VALUE = _first_env(["MONDAY_ACTIONS_ASSISTANT_VALUE"], "AI Subsidy Assistant").strip()
 
 # Action owner mapping (People / Multiple persons column)
-MONDAY_ACTION_OWNER_COL_ID = "multiple_person_mkv090pp"
-DB_ACTION_OWNER_COL = "action_owner"
+MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multiple_person_mkv090pp").strip()
+DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip()
 
 # Reminder schedule (timezone-aware)
-REMINDER_DAY_OF_WEEK = "mon"
-REMINDER_HOUR = 9
-REMINDER_MINUTE = 0
-REMINDER_TIMEZONE = "Africa/Tunis"
+REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "mon").strip().lower()
+REMINDER_HOUR = _env_int("REMINDER_HOUR", 9)
+REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 0)
+REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 
-# Flask application settings
-DEBUG = True
-USE_RELOADER = True
-HOST = "0.0.0.0"
-PORT = 5000
 
 # =============================================================================
 # Helpers
@@ -1368,39 +1431,33 @@ def internal_error(_):
 
 
 # =============================================================================
-# Run
+# Initialize background services ALWAYS (Simple Azure-Compatible Approach)
+# =============================================================================
+
+print("[app] Initializing background services...", flush=True)
+
+# Start Monday.com polling if enabled
+start_polling_if_enabled()
+
+# Start the scheduler for weekly email reminders
+scheduler = start_scheduler()
+
+# Setup cleanup on exit
+import atexit
+atexit.register(lambda: scheduler.shutdown() if scheduler else None)
+
+print("[app] Background services initialized successfully", flush=True)
+
+# =============================================================================
+# Run Flask
 # =============================================================================
 if __name__ == "__main__":
-    # Runtime flags (hardcoded)
-    DEBUG = True
-    USE_RELOADER = True
-    HOST = "0.0.0.0"
-    PORT = 5000
-
-    def _should_start_background_jobs() -> bool:
-        # When Flask reloader is enabled, the app starts twice.
-        # Only run background threads/schedulers in the reloader child process.
-        if not USE_RELOADER:
-            return True
-        return os.environ.get("WERKZEUG_RUN_MAIN") == "true"
-
-    scheduler = None
-
-    if _should_start_background_jobs():
-        # Start Monday.com polling if enabled
-        start_polling_if_enabled()
-
-        # Start the scheduler for weekly email reminders
-        scheduler = start_scheduler()
-    else:
-        print("[app] Flask reloader parent process: background jobs not started.", flush=True)
-
-    try:
-        app.run(debug=DEBUG, host=HOST, port=PORT, use_reloader=USE_RELOADER)
-    except (KeyboardInterrupt, SystemExit):
-        if scheduler:
-            try:
-                scheduler.shutdown()
-            except Exception:
-                pass
-        print("[app] Shutting down gracefully...", flush=True)
+    # For local development only
+    DEBUG = _env_bool("FLASK_DEBUG", _env_bool("DEBUG", True))
+    USE_RELOADER = _env_bool("USE_RELOADER", DEBUG)  # Only use reloader locally
+    
+    HOST = _first_env(["FLASK_RUN_HOST"], "0.0.0.0")
+    PORT = int(_first_env(["PORT", "FLASK_RUN_PORT"], "5000"))
+    
+    print(f"[app] Starting Flask server in {'DEBUG' if DEBUG else 'PRODUCTION'} mode", flush=True)
+    app.run(debug=DEBUG, host=HOST, port=PORT, use_reloader=USE_RELOADER)
