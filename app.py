@@ -1,17 +1,18 @@
+# app.py
 import os
 import re
 import json
 import time
 import threading
 import smtplib
+import atexit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import date, datetime
 from typing import Dict, List, Optional, Any, Set, Tuple
 
 try:
-    # Python 3.9+
-    from zoneinfo import ZoneInfo  # type: ignore
+    from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
     ZoneInfo = None  # type: ignore
 
@@ -23,70 +24,11 @@ from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+
 # =============================================================================
-# Load .env (optional)
+# Env helpers
 # =============================================================================
-def _load_dotenv_if_present() -> None:
-    """Load environment variables from a .env file if present.
-
-    - Uses python-dotenv if installed.
-    - Falls back to a minimal KEY=VALUE parser.
-    """
-    # 1) python-dotenv (best)
-    try:
-        from dotenv import load_dotenv  # type: ignore
-        load_dotenv(override=False)
-        return
-    except Exception:
-        pass
-
-    # 2) minimal fallback parser
-    preexisting = set(os.environ.keys())
-
-    candidates: List[str] = []
-    try:
-        candidates.append(os.path.join(os.getcwd(), ".env"))
-    except Exception:
-        pass
-    try:
-        candidates.append(os.path.join(os.path.dirname(__file__), ".env"))
-    except Exception:
-        pass
-
-    for env_path in candidates:
-        if not env_path or not os.path.isfile(env_path):
-            continue
-        try:
-            parsed: Dict[str, str] = {}
-            with open(env_path, "r", encoding="utf-8") as f:
-                for raw in f:
-                    line = raw.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, val = line.split("=", 1)
-                    key = key.strip()
-                    val = val.strip()
-                    if not key:
-                        continue
-                    # remove surrounding quotes
-                    if len(val) >= 2 and ((val[0] == val[-1] == '"') or (val[0] == val[-1] == "'")):
-                        val = val[1:-1]
-                    # last definition wins within the .env file
-                    parsed[key] = val
-
-            for k, v in parsed.items():
-                if k not in preexisting:
-                    os.environ[k] = v
-        except Exception:
-            # best-effort: never crash startup because of .env parsing
-            pass
-
-
-_load_dotenv_if_present()
-
-
 def _first_env(keys: List[str], default: str = "") -> str:
-    """Return the first non-empty environment variable among keys."""
     for k in keys:
         v = os.getenv(k)
         if v is not None and str(v).strip() != "":
@@ -134,80 +76,72 @@ app = Flask(__name__)
 CORS(app)
 
 # =============================================================================
-# CONFIG
+# CONFIG (use Azure App Settings / env vars in production)
 # =============================================================================
 
-# PostgreSQL settings (supports both PG* and DB_* env names)
+# PostgreSQL
 DB_CONFIG = {
     "host": _first_env(["PGHOST", "DB_HOST"], "avo-adb-002.postgres.database.azure.com"),
     "database": _first_env(["PGDATABASE", "DB_NAME"], "Subsidy_DB"),
     "user": _first_env(["PGUSER", "DB_USER"], "administrationSTS"),
-    "password": _first_env(["PGPASSWORD", "DB_PASSWORD"], ""),
+    "password": _first_env(["PGPASSWORD", "DB_PASSWORD"], "St$@0987"),
     "port": int(_first_env(["PGPORT", "DB_PORT"], "5432")),
     "sslmode": _first_env(["PGSSLMODE"], "require"),
 }
 
 # Email settings
-SMTP_SERVER = _first_env(["SMTP_SERVER", "EMAIL_HOST"], "")
-SMTP_PORT = int(_first_env(["SMTP_PORT", "EMAIL_PORT"], "587"))
-EMAIL_USER = _first_env(["EMAIL_USER"], "")
-EMAIL_PASSWORD = _first_env(["EMAIL_PASSWORD", "EMAIL_PASS"], "")
+SMTP_SERVER = _first_env(["SMTP_SERVER"], "avocarbon-com.mail.protection.outlook.com")
+SMTP_PORT = int(_first_env(["SMTP_PORT"], "25"))
+EMAIL_USER = _first_env(["EMAIL_USER"], "administration.STS@avocarbon.com")
+EMAIL_PASSWORD = _first_env(["EMAIL_PASSWORD"], "")  # relay mode usually empty
 
-# Optional unauthenticated fallback (Direct Send / SMTP relay on port 25)
-SMTP_FALLBACK_SERVER = _first_env(["SMTP_FALLBACK_SERVER", "EMAIL_HOST"], "")
-SMTP_FALLBACK_PORT = int(_first_env(["SMTP_FALLBACK_PORT", "EMAIL_PORT"], "25"))
+SMTP_FALLBACK_SERVER = _first_env(["SMTP_FALLBACK_SERVER"], SMTP_SERVER)
+SMTP_FALLBACK_PORT = int(_first_env(["SMTP_FALLBACK_PORT"], "25"))
 SMTP_AUTH_MODE = _first_env(["SMTP_AUTH_MODE"], "auto").lower()  # auto | login | none
 SMTP_ALLOW_NO_AUTH_FALLBACK = _env_bool("SMTP_ALLOW_NO_AUTH_FALLBACK", True)
 
-# Restrict unauthenticated sends to internal domains (recommended)
 SMTP_INTERNAL_DOMAINS = [
     d.strip().lower()
-    for d in _first_env(["SMTP_INTERNAL_DOMAINS"], "").split(",")
+    for d in _first_env(["SMTP_INTERNAL_DOMAINS"], "avocarbon.com").split(",")
     if d.strip()
 ]
-if not SMTP_INTERNAL_DOMAINS and "@" in EMAIL_USER:
-    SMTP_INTERNAL_DOMAINS = [EMAIL_USER.split("@", 1)[1].lower()]
 
-# monday.com settings
-MONDAY_API_KEY = _first_env(["MONDAY_API_KEY"], "")
+# monday.com
+MONDAY_API_KEY = _first_env(["MONDAY_API_KEY"], "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzNzU5MzQ0NywiYWFpIjoxMSwidWlkIjo3NjQ5MDYwMiwiaWFkIjoiMjAyNS0wNy0xMFQxNTo0Mzo0OS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.MhRXxTDVZlx2FSnPii_PZ8dD39Q_kCdZXsrEjOCt4i4")
 MONDAY_BOARD_REQUESTS_ID = int(_first_env(["MONDAY_BOARD_REQUESTS_ID"], "9612741617"))
 MONDAY_BOARD_ACTIONS_ID = int(_first_env(["MONDAY_BOARD_ACTIONS_ID"], "9366723818"))
-
-# monday.com base URL (used to build clickable item links)
 MONDAY_BASE_URL = _first_env(["MONDAY_BASE_URL"], "https://avocarbon.monday.com")
 
-# monday.com column IDs (actions board)
-# "Identifiant de l'élément" (type item_id)
 MONDAY_ACTION_ITEM_ID_COL_ID = _first_env(["MONDAY_ACTION_ITEM_ID_COL_ID"], "pulse_id_mkzk18n7")
-# "Action détaillé" (set this env var to the exact monday column id)
 MONDAY_ACTION_DETAIL_COL_ID = _first_env(["MONDAY_ACTION_DETAIL_COL_ID"], "").strip()
 
-# Tables
+# DB tables / keys
 DB_TABLE_REQUESTS = _first_env(["DB_TABLE_REQUESTS"], "subsidy_requests")
 DB_TABLE_ACTIONS = _first_env(["DB_TABLE_ACTIONS"], "subsidy_action_plan")
+DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")
+DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")
 
-# External keys (monday item ID stored here)
-DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")  # subsidy_requests.element_id
-DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")     # subsidy_action_plan.action_id
-
-# Polling interval (seconds)
-MONDAY_SYNC_INTERVAL = int(_first_env(["MONDAY_SYNC_INTERVAL"], "0"))
-
-# Optional: filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
-# You MUST provide the column ID (not the title).
+# Polling interval (seconds). Safer default is OFF unless explicitly set.
+MONDAY_SYNC_INTERVAL = 600
+# Optional filter for actions board
 MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "").strip()
 MONDAY_ACTIONS_ASSISTANT_VALUE = _first_env(["MONDAY_ACTIONS_ASSISTANT_VALUE"], "AI Subsidy Assistant").strip()
 
-# Action owner mapping (People / Multiple persons column)
+# Owner mapping
 MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multiple_person_mkv090pp").strip()
 DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip()
 
-# Reminder schedule (timezone-aware)
+# Reminder schedule
 REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "mon").strip().lower()
 REMINDER_HOUR = _env_int("REMINDER_HOUR", 9)
 REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 0)
 REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
+
+# Background jobs toggles (handy in Azure)
+ENABLE_BACKGROUND_JOBS = _env_bool("ENABLE_BACKGROUND_JOBS", True)
+ENABLE_POLLING_SYNC = _env_bool("ENABLE_POLLING_SYNC", True)
+ENABLE_EMAIL_SCHEDULER = _env_bool("ENABLE_EMAIL_SCHEDULER", True)
 
 
 # =============================================================================
@@ -234,10 +168,6 @@ def sanitize_column_name(title: str) -> str:
 
 
 def normalize_value(text: Any) -> Any:
-    """
-    - empty string -> None (prevents numeric/date errors)
-    - numeric-like strings -> int / float
-    """
     if text is None:
         return None
     if isinstance(text, str):
@@ -285,10 +215,6 @@ def monday_query(api_key: str, query: str) -> Dict[str, Any]:
 
 
 def query_monday_items(api_key: str, board_id: int, limit: int = 100) -> List[Dict[str, Any]]:
-    """
-    Fetch items from a board (first page).
-    IMPORTANT: includes column_values.value so we can extract People column IDs.
-    """
     query = f"""
     {{
       boards(ids: {board_id}) {{
@@ -321,10 +247,6 @@ def query_monday_actions_filtered(
     column_value: str,
     limit: int = 100
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch only actions items matching a column filter.
-    IMPORTANT: includes column_values.value so we can extract People column IDs.
-    """
     query = f"""
     {{
       items_page_by_column_values(
@@ -350,20 +272,15 @@ def query_monday_actions_filtered(
 
 
 # =============================================================================
-# People column -> emails (Action Owner)
+# People column -> emails
 # =============================================================================
 def extract_people_ids_from_value(value_str: Optional[str]) -> List[int]:
-    """
-    monday People (multiple) column 'value' is JSON like:
-    {"personsAndTeams":[{"id":76490602,"kind":"person"}, ...]}
-    """
     if not value_str:
         return []
     try:
         data = json.loads(value_str)
     except Exception:
         return []
-
     pts = data.get("personsAndTeams", []) or []
     ids: List[int] = []
     for x in pts:
@@ -376,15 +293,10 @@ def extract_people_ids_from_value(value_str: Optional[str]) -> List[int]:
 
 
 def fetch_user_emails(api_key: str, user_ids: List[int]) -> Dict[int, str]:
-    """
-    Returns {user_id: email}
-    """
     if not user_ids:
         return {}
-
     unique_ids = sorted(set(int(i) for i in user_ids))
     ids_csv = ",".join(str(i) for i in unique_ids)
-
     query = f"""
     {{
       users(ids: [{ids_csv}]) {{
@@ -406,7 +318,7 @@ def fetch_user_emails(api_key: str, user_ids: List[int]) -> Dict[int, str]:
 
 
 # =============================================================================
-# Mapping monday -> DB row (ONLY columns that exist)
+# Mapping monday -> DB row
 # =============================================================================
 def map_item_to_db_values(
     item: Dict[str, Any],
@@ -415,12 +327,6 @@ def map_item_to_db_values(
     monday_item_id: int,
     is_actions_table: bool = False,
 ) -> Dict[str, Any]:
-    """
-    Builds dict of db_col -> value only for columns that exist in DB.
-    Always sets:
-      - key_col (element_id/action_id) = monday item id
-      - name = item.name (if exists)
-    """
     values: Dict[str, Any] = {}
 
     if key_col in db_columns:
@@ -438,15 +344,7 @@ def map_item_to_db_values(
             if v is not None:
                 values[db_guess] = v
 
-    # ------------------------------------------------------------------------
-    # Special mappings for actions board
-    # ------------------------------------------------------------------------
-
-    # 1) action_detail mapping
-    # Preferred: map by monday column id (stable even if title changes / accents).
-    # Fallback: match by column title for backward compatibility.
     if is_actions_table and "action_detail" in db_columns:
-        # By column id (recommended)
         if MONDAY_ACTION_DETAIL_COL_ID:
             for cv in item.get("column_values", []) or []:
                 if cv.get("id") == MONDAY_ACTION_DETAIL_COL_ID:
@@ -455,7 +353,6 @@ def map_item_to_db_values(
                         values["action_detail"] = v
                     break
         else:
-            # Fallback by title
             for cv in item.get("column_values", []) or []:
                 col = cv.get("column") or {}
                 title = (col.get("title") or "").strip().lower()
@@ -472,8 +369,6 @@ def map_item_to_db_values(
                         values["action_detail"] = v
                     break
 
-    # 2) item_link mapping (clickable monday item URL)
-    # Uses the monday item_id column "Identifiant de l'élément" (type item_id).
     if is_actions_table and "item_link" in db_columns:
         item_id_str: str = ""
         for cv in item.get("column_values", []) or []:
@@ -486,9 +381,8 @@ def map_item_to_db_values(
     return values
 
 
-
 # =============================================================================
-# DB upsert/delete using external keys (element_id / action_id)
+# DB upsert/delete
 # =============================================================================
 def exists_by_key(cur, table: str, key_col: str, key_val: int) -> bool:
     cur.execute(f"SELECT 1 FROM {table} WHERE {key_col} = %s", (key_val,))
@@ -514,29 +408,17 @@ def update_row(cur, table: str, key_col: str, key_val: int, values: Dict[str, An
 
 
 def upsert_by_key(cur, table: str, key_col: str, values: Dict[str, Any]) -> str:
-    """
-    Upsert using external key_col (element_id/action_id).
-    Does NOT touch identity column id.
-    Returns "insert" or "update".
-    """
     if key_col not in values:
         raise RuntimeError(f"Missing key '{key_col}' for table {table}")
-
     key_val = int(values[key_col])
-
     if exists_by_key(cur, table, key_col, key_val):
         update_row(cur, table, key_col, key_val, values)
         return "update"
-
     insert_row(cur, table, values)
     return "insert"
 
 
 def delete_missing_by_key(cur, table: str, key_col: str, keep_ids: Set[int]) -> int:
-    """
-    Delete rows whose key_col is not in keep_ids.
-    NOTE: If you filter actions, this will delete rows that fall out of the filter.
-    """
     if not keep_ids:
         cur.execute(f"DELETE FROM {table} WHERE {key_col} IS NOT NULL")
         return cur.rowcount
@@ -561,10 +443,6 @@ def delete_missing_by_key(cur, table: str, key_col: str, keep_ids: Set[int]) -> 
 # FULL SYNC
 # =============================================================================
 def fetch_monday_items_for_sync() -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Returns (requests_items, actions_items)
-    Actions can be filtered by Assistant Generator if MONDAY_ACTIONS_ASSISTANT_COL_ID is set.
-    """
     if not MONDAY_API_KEY:
         raise RuntimeError("MONDAY_API_KEY is missing")
 
@@ -585,12 +463,6 @@ def fetch_monday_items_for_sync() -> Tuple[List[Dict[str, Any]], List[Dict[str, 
 
 
 def perform_full_sync() -> Dict[str, Any]:
-    """
-    1) Fetch monday items
-    2) Upsert into DB using element_id/action_id
-    3) Delete DB rows missing from monday using element_id/action_id
-    4) NEW: For actions, fill action_owner (email) from People column id multiple_person_mkv090pp
-    """
     requests_items, actions_items = fetch_monday_items_for_sync()
 
     summary = {
@@ -603,9 +475,6 @@ def perform_full_sync() -> Dict[str, Any]:
         req_cols = get_table_columns(conn, DB_TABLE_REQUESTS)
         act_cols = get_table_columns(conn, DB_TABLE_ACTIONS)
 
-        # -------------------------
-        # Pre-fetch ALL user emails used in Actions (efficient)
-        # -------------------------
         all_people_ids: List[int] = []
         for it in actions_items:
             for cv in it.get("column_values", []) or []:
@@ -615,17 +484,12 @@ def perform_full_sync() -> Dict[str, Any]:
 
         with conn:
             with conn.cursor() as cur:
-                # -------------------------
-                # Requests board -> subsidy_requests (key = element_id)
-                # -------------------------
                 request_ids: Set[int] = set()
                 for it in requests_items:
                     mid = int(it["id"])
                     request_ids.add(mid)
 
-                    vals = map_item_to_db_values(
-                        it, req_cols, DB_KEY_REQUESTS, mid, is_actions_table=False
-                    )
+                    vals = map_item_to_db_values(it, req_cols, DB_KEY_REQUESTS, mid, is_actions_table=False)
                     action = upsert_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, vals)
 
                     if action == "insert":
@@ -633,25 +497,15 @@ def perform_full_sync() -> Dict[str, Any]:
                     else:
                         summary["requests"]["updated"] += 1
 
-                summary["requests"]["deleted"] = delete_missing_by_key(
-                    cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, request_ids
-                )
+                summary["requests"]["deleted"] = delete_missing_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, request_ids)
 
-                # -------------------------
-                # Actions board -> subsidy_action_plan (key = action_id)
-                # + NEW: action_owner = owner email
-                # -------------------------
                 action_ids: Set[int] = set()
                 for it in actions_items:
                     mid = int(it["id"])
                     action_ids.add(mid)
 
-                    vals = map_item_to_db_values(
-                        it, act_cols, DB_KEY_ACTIONS, mid, is_actions_table=True
-                    )
+                    vals = map_item_to_db_values(it, act_cols, DB_KEY_ACTIONS, mid, is_actions_table=True)
 
-                    # NEW: action_owner email from People column id multiple_person_mkv090pp
-                    # If multiple people, we take the first email (your requirement: "contient la valeur de son email").
                     owner_email: Optional[str] = None
                     for cv in it.get("column_values", []) or []:
                         if cv.get("id") == MONDAY_ACTION_OWNER_COL_ID:
@@ -674,10 +528,7 @@ def perform_full_sync() -> Dict[str, Any]:
                     else:
                         summary["actions"]["updated"] += 1
 
-                summary["actions"]["deleted"] = delete_missing_by_key(
-                    cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, action_ids
-                )
-
+                summary["actions"]["deleted"] = delete_missing_by_key(cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, action_ids)
     finally:
         conn.close()
 
@@ -699,29 +550,22 @@ def _sync_loop():
 
 
 def start_polling_if_enabled():
+    if not ENABLE_POLLING_SYNC:
+        print("[sync_thread] Polling disabled (ENABLE_POLLING_SYNC=false)", flush=True)
+        return
+
     if MONDAY_SYNC_INTERVAL > 0:
         t = threading.Thread(target=_sync_loop, daemon=True)
         t.start()
         print(f"[sync_thread] Polling enabled every {MONDAY_SYNC_INTERVAL}s", flush=True)
+    else:
+        print("[sync_thread] Polling not started: MONDAY_SYNC_INTERVAL <= 0", flush=True)
 
 
 # =============================================================================
 # EMAIL FUNCTIONS
 # =============================================================================
 def send_email(to_email: str, subject: str, body_html: str) -> bool:
-    """
-    Send an email using the configured SMTP settings.
-
-    Supports:
-      - SMTP AUTH (LOGIN) when enabled (typically smtp.office365.com:587 + STARTTLS)
-      - Optional fallback to an unauthenticated relay / "Direct Send" (typically <domain>.mail.protection.outlook.com:25)
-
-    Why this matters:
-      Microsoft 365 tenants often disable basic authentication for SMTP AUTH, which causes:
-      (535, '5.7.139 Authentication unsuccessful, basic authentication is disabled')
-      In that case, this function can automatically fall back to a no-auth relay (if configured).
-    """
-
     def _email_domain(addr: str) -> str:
         addr = (addr or "").strip().lower()
         if "@" not in addr:
@@ -730,15 +574,14 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
 
     def _is_internal_recipient(addr: str) -> bool:
         if not SMTP_INTERNAL_DOMAINS:
-            return True  # nothing to validate against
+            return True
         return _email_domain(addr) in set(SMTP_INTERNAL_DOMAINS)
 
-    # Decide auth usage
     server_host = (SMTP_SERVER or "").strip()
     server_port = int(SMTP_PORT)
 
     if not server_host:
-        print("[email] SMTP_SERVER is empty. Please set SMTP_SERVER in your environment.", flush=True)
+        print("[email] SMTP_SERVER is empty.", flush=True)
         return False
 
     auth_mode = (SMTP_AUTH_MODE or "auto").strip().lower()
@@ -749,13 +592,10 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
     elif auth_mode in {"login", "auth", "true", "1"}:
         use_auth = True
     else:
-        # auto
         use_auth = bool(EMAIL_PASSWORD)
-        # Office 365 MX endpoints typically do not support AUTH
         if server_port == 25 and looks_like_o365_mx:
             use_auth = False
 
-    # Build message
     msg = MIMEMultipart("alternative")
     msg["From"] = EMAIL_USER or ""
     msg["To"] = to_email
@@ -767,7 +607,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             raise RuntimeError("SMTP host is empty")
 
         if not do_auth:
-            # Safety: prevent unauthenticated external sends by default
             if not _is_internal_recipient(to_email):
                 raise RuntimeError(
                     f"Refusing unauthenticated send to external domain: {to_email} (allowed: {SMTP_INTERNAL_DOMAINS})"
@@ -776,7 +615,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
         with smtplib.SMTP(host, port, timeout=30) as server:
             server.ehlo()
 
-            # STARTTLS: required on 587; optional elsewhere if offered.
             want_starttls = (port == 587) or _env_bool("SMTP_USE_STARTTLS", True)
             if want_starttls and server.has_extn("starttls"):
                 server.starttls()
@@ -789,17 +627,15 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
 
             server.send_message(msg)
 
-    # 1) Try primary server
     try:
         _smtp_send(server_host, server_port, do_auth=use_auth)
-        print(f"[email] Successfully sent to {to_email} via {server_host}:{server_port} (auth={use_auth})", flush=True)
+        print(f"[email] Sent to {to_email} via {server_host}:{server_port} (auth={use_auth})", flush=True)
         return True
 
     except smtplib.SMTPAuthenticationError as e:
         err = str(e)
         print(f"[email] SMTP AUTH failed via {server_host}:{server_port}: {err}", flush=True)
 
-        # If basic auth is disabled, retry with configured fallback (no-auth)
         basic_auth_disabled = ("5.7.139" in err) or ("basic authentication is disabled" in err.lower())
 
         if SMTP_ALLOW_NO_AUTH_FALLBACK and basic_auth_disabled:
@@ -809,10 +645,7 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             if fb_host and (fb_host != server_host or fb_port != server_port):
                 try:
                     _smtp_send(fb_host, fb_port, do_auth=False)
-                    print(
-                        f"[email] Successfully sent to {to_email} via fallback {fb_host}:{fb_port} (auth=False)",
-                        flush=True,
-                    )
+                    print(f"[email] Sent via fallback {fb_host}:{fb_port} (auth=False)", flush=True)
                     return True
                 except Exception as e2:
                     print(f"[email] Fallback send failed via {fb_host}:{fb_port}: {e2}", flush=True)
@@ -825,14 +658,10 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
 
 
 def get_late_actions() -> List[Dict[str, Any]]:
-    """
-    Fetch all actions with status='Late' from subsidy_action_plan.
-    Returns list of dicts with action details.
-    """
     conn = get_db_connection()
     try:
         query = f"""
-        SELECT 
+        SELECT
             id,
             name,
             action_id,
@@ -857,17 +686,10 @@ def get_late_actions() -> List[Dict[str, Any]]:
 
 
 def create_reminder_email_body(owner_email: str, actions: List[Dict[str, Any]]) -> str:
-    """
-    Create HTML email body in a single-list "follow-up" format (relance).
-    - owner_email: recipient email
-    - actions: list of late actions for that recipient
-    """
-
     def _action_li(a: Dict[str, Any]) -> str:
         name = (a.get("name") or "Untitled action").strip()
         detail = (a.get("action_detail") or "").strip()
         link = (a.get("item_link") or "").strip()
-
         name_html = f'<a href="{link}" target="_blank" rel="noopener noreferrer">{name}</a>' if link else name
         suffix = f" – {detail}" if detail else ""
         return f"<li>{name_html}{suffix}</li>"
@@ -898,23 +720,12 @@ def create_reminder_email_body(owner_email: str, actions: List[Dict[str, Any]]) 
                 <p>
                     Below is the list of <b>late subsidy actions</b> that require an update or follow-up from your side:
                 </p>
-
                 <ul>
                     {items_html}
                 </ul>
-
-                <p>
-                    Please share a progress update or close the actions that are already completed.
-                </p>
-
-                <p>
-                    Best regards,<br/>
-                    AI Subsidy Assistant
-                </p>
-
-                <div class="hint">
-                    This is an automated reminder sent to {owner_email}. Please do not reply to this email.
-                </div>
+                <p>Please share a progress update or close the actions that are already completed.</p>
+                <p>Best regards,<br/>AI Subsidy Assistant</p>
+                <div class="hint">This is an automated reminder sent to {owner_email}. Please do not reply to this email.</div>
             </div>
         </div>
     </body>
@@ -922,36 +733,18 @@ def create_reminder_email_body(owner_email: str, actions: List[Dict[str, Any]]) 
     """
 
 
-
 def send_late_action_reminders() -> Dict[str, Any]:
-    """
-    Check for late actions and send reminder emails to action owners.
-    Sends **one email per owner** with a bullet list of late actions (relance format).
-    Returns summary of emails sent.
-    """
     print("[cron] Starting weekly late action check...", flush=True)
-
     try:
         late_actions = get_late_actions()
-
         if not late_actions:
-            print("[cron] No late actions found.", flush=True)
-            return {
-                "success": True,
-                "late_actions_count": 0,
-                "emails_sent": 0,
-                "emails_failed": 0,
-                "message": "No late actions found",
-            }
+            return {"success": True, "late_actions_count": 0, "emails_sent": 0, "emails_failed": 0, "message": "No late actions found"}
 
-        # Group late actions by owner email
         actions_by_owner: Dict[str, List[Dict[str, Any]]] = {}
         for action in late_actions:
             owner_email = (action.get("action_owner") or "").strip()
-            if not owner_email:
-                print(f"[cron] Skipping action {action.get('action_id')} - no owner email", flush=True)
-                continue
-            actions_by_owner.setdefault(owner_email, []).append(action)
+            if owner_email:
+                actions_by_owner.setdefault(owner_email, []).append(action)
 
         emails_sent = 0
         emails_failed = 0
@@ -959,7 +752,6 @@ def send_late_action_reminders() -> Dict[str, Any]:
         for owner_email, owner_actions in actions_by_owner.items():
             subject = f"Follow-up required: {len(owner_actions)} late subsidy action(s)"
             body = create_reminder_email_body(owner_email, owner_actions)
-
             if send_email(owner_email, subject, body):
                 emails_sent += 1
             else:
@@ -973,32 +765,19 @@ def send_late_action_reminders() -> Dict[str, Any]:
             "emails_failed": emails_failed,
             "timestamp": datetime.now().isoformat(),
         }
-
     except Exception as e:
-        print(f"[cron] Error during late action check: {e}", flush=True)
-        return {
-            "success": False,
-            "error": str(e),
-            "timestamp": datetime.now().isoformat(),
-        }
-
+        return {"success": False, "error": str(e), "timestamp": datetime.now().isoformat()}
 
 
 # =============================================================================
-# SCHEDULER SETUP
+# Scheduler
 # =============================================================================
 def start_scheduler():
-    """
-    Start the background scheduler for weekly email reminders.
+    if not ENABLE_EMAIL_SCHEDULER:
+        print("[scheduler] Disabled (ENABLE_EMAIL_SCHEDULER=false)", flush=True)
+        return None
 
-    Controlled by .env:
-      - REMINDER_DAY_OF_WEEK (e.g. mon)
-      - REMINDER_HOUR (0-23)
-      - REMINDER_MINUTE (0-59)
-      - REMINDER_TIMEZONE (e.g. Africa/Tunis)
-    """
     tz = REMINDER_TZINFO
-
     scheduler = BackgroundScheduler(timezone=tz) if tz else BackgroundScheduler()
 
     trigger = CronTrigger(
@@ -1015,26 +794,20 @@ def start_scheduler():
         name="Weekly Late Action Reminder",
         replace_existing=True,
         coalesce=True,
-        misfire_grace_time=3600,  # 1 hour
+        misfire_grace_time=3600,
     )
 
     scheduler.start()
-
-    tz_label = REMINDER_TIMEZONE if REMINDER_TIMEZONE else "local"
-    print(
-        f"[scheduler] Weekly reminder job scheduled: {REMINDER_DAY_OF_WEEK} at {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({tz_label})",
-        flush=True,
-    )
-
+    print(f"[scheduler] Weekly reminder scheduled: {REMINDER_DAY_OF_WEEK} {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({REMINDER_TIMEZONE})", flush=True)
     return scheduler
 
 
 # =============================================================================
-# KPI DATA FETCHERS
+# KPI data / calculations (unchanged from your code)
 # =============================================================================
 def get_subsidy_requests_data(connection) -> pd.DataFrame:
     query = f"""
-    SELECT 
+    SELECT
         id,
         name,
         applicant_name,
@@ -1053,7 +826,7 @@ def get_subsidy_requests_data(connection) -> pd.DataFrame:
 
 def get_action_plan_data(connection) -> pd.DataFrame:
     query = f"""
-    SELECT 
+    SELECT
         id,
         name,
         action_id,
@@ -1074,9 +847,6 @@ def _clean_text(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip()
 
 
-# =============================================================================
-# KPI CALCULATIONS
-# =============================================================================
 def calculate_global_kpis(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict:
     df = subsidy_requests.copy()
     ap = action_plan.copy()
@@ -1153,7 +923,7 @@ def calculate_kpis_by_site(subsidy_requests: pd.DataFrame, action_plan: pd.DataF
         completed = int((site_ap["status"] == "Completed").sum()) if "status" in site_ap.columns else 0
         late = int((site_ap["status"] == "Late").sum()) if "status" in site_ap.columns else 0
 
-        row = {
+        rows.append({
             "Site": site,
             "Demandes spontanées": int(spontaneous_mask.sum()),
             "Montants en cours (€)": float(site_req.loc[in_progress_mask, "estimated_budget"].sum()) if "estimated_budget" in site_req.columns else 0.0,
@@ -1165,8 +935,7 @@ def calculate_kpis_by_site(subsidy_requests: pd.DataFrame, action_plan: pd.DataF
             "Success Rate (validated)%": float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
             "Percent Positive Answers%": float(validated_mask.sum() / max(total, 1) * 100),
             "Impact on Competitiveness%": float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
-        }
-        rows.append(row)
+        })
 
     return pd.DataFrame(rows)
 
@@ -1206,7 +975,7 @@ def calculate_kpis_by_project(subsidy_requests: pd.DataFrame, action_plan: pd.Da
         completed = int((proj_actions["status"] == "Completed").sum()) if "status" in proj_actions.columns else 0
         late = int((proj_actions["status"] == "Late").sum()) if "status" in proj_actions.columns else 0
 
-        row = {
+        rows.append({
             "Projet": project,
             "Site": site,
             "Demandes spontanées": int(spontaneous_mask.sum()),
@@ -1219,64 +988,30 @@ def calculate_kpis_by_project(subsidy_requests: pd.DataFrame, action_plan: pd.Da
             "Success Rate (validated)%": float((won_mask & validated_mask).sum() / max(int(validated_mask.sum()), 1) * 100),
             "Percent Positive Answers%": float(validated_mask.sum() / max(total, 1) * 100),
             "Impact on Competitiveness%": float((awd_sum / est_sum * 100) if est_sum > 0 else 0.0),
-        }
-        rows.append(row)
+        })
 
     return pd.DataFrame(rows)
 
 
 def get_detailed_data_for_visualization(subsidy_requests: pd.DataFrame, action_plan: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    viz_data = {}
-    viz_data["requests_summary"] = subsidy_requests[
-        ["name", "site_location", "request_type", "decision", "estimated_budget", "amount_awarded", "date_creation"]
-    ].copy()
-
-    viz_data["actions_summary"] = action_plan[
-        ["project_title", "plant", "status", "action_type", "initiation_date", "due_date", "expected_gain"]
-    ].copy()
-    return viz_data
+    return {
+        "requests_summary": subsidy_requests[["name", "site_location", "request_type", "decision", "estimated_budget", "amount_awarded", "date_creation"]].copy(),
+        "actions_summary": action_plan[["project_title", "plant", "status", "action_type", "initiation_date", "due_date", "expected_gain"]].copy(),
+    }
 
 
 # =============================================================================
-# API Routes
+# API routes
 # =============================================================================
 @app.route("/")
 def home():
     return jsonify({
-        "message": "Subsidy KPI API + Monday Polling Sync (with action_owner email) + Weekly Reminders",
-        "version": "5.0",
+        "message": "Subsidy KPI API + Polling Sync + Weekly Reminders",
         "polling_interval_seconds": MONDAY_SYNC_INTERVAL,
-        "email_reminders": {
-            "enabled": True,
-            "schedule": "Every Monday at 9:00 AM",
-            "smtp_server": SMTP_SERVER,
-            "from_email": EMAIL_USER
-        },
-        "actions_filter": {
-            "enabled": bool(MONDAY_ACTIONS_ASSISTANT_COL_ID),
-            "column_id": MONDAY_ACTIONS_ASSISTANT_COL_ID,
-            "value": MONDAY_ACTIONS_ASSISTANT_VALUE,
-        },
-        "action_owner_mapping": {
-            "monday_col_id": MONDAY_ACTION_OWNER_COL_ID,
-            "db_column": DB_ACTION_OWNER_COL,
-            "note": "If multiple people are assigned, the first email found is stored.",
-        },
-        "db_keys": {
-            "requests_key": f"{DB_TABLE_REQUESTS}.{DB_KEY_REQUESTS}",
-            "actions_key": f"{DB_TABLE_ACTIONS}.{DB_KEY_ACTIONS}",
-        },
-        "endpoints": {
-            "/health": "GET - Health check",
-            "/sync": "GET/POST - Manual full sync (insert/update/delete)",
-            "/send-reminders": "GET/POST - Manual trigger for late action reminders",
-            "/api/kpis/global": "GET - Global KPIs",
-            "/api/kpis/by-site": "GET - KPIs by site",
-            "/api/kpis/by-project": "GET - KPIs by project",
-            "/api/kpis/all": "GET - All KPIs combined",
-            "/api/data/requests": "GET - Subsidy requests data",
-            "/api/data/actions": "GET - Action plan data",
-            "/api/data/visualization": "GET - Data for visualization",
+        "background_jobs": {
+            "ENABLE_BACKGROUND_JOBS": ENABLE_BACKGROUND_JOBS,
+            "ENABLE_POLLING_SYNC": ENABLE_POLLING_SYNC,
+            "ENABLE_EMAIL_SCHEDULER": ENABLE_EMAIL_SCHEDULER,
         }
     })
 
@@ -1297,10 +1032,6 @@ def sync_now():
 
 @app.route("/send-reminders", methods=["GET", "POST"])
 def trigger_reminders():
-    """
-    Manual endpoint to trigger late action reminder emails.
-    Useful for testing or manual execution.
-    """
     try:
         result = send_late_action_reminders()
         return jsonify(result), 200
@@ -1431,33 +1162,49 @@ def internal_error(_):
 
 
 # =============================================================================
-# Initialize background services ALWAYS (Simple Azure-Compatible Approach)
+# Background jobs bootstrap (WSGI/Azure compatible, avoids local reloader double start)
 # =============================================================================
+_background_started = False
+_scheduler_instance = None
 
-print("[app] Initializing background services...", flush=True)
+def start_background_services_once():
+    global _background_started, _scheduler_instance
 
-# Start Monday.com polling if enabled
-start_polling_if_enabled()
+    if not ENABLE_BACKGROUND_JOBS:
+        print("[jobs] Disabled (ENABLE_BACKGROUND_JOBS=false)", flush=True)
+        return
+    if _background_started:
+        return
 
-# Start the scheduler for weekly email reminders
-scheduler = start_scheduler()
+    # Local debug reloader guard (prevents double start in dev)
+    if _env_bool("USE_RELOADER", False) and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        print("[jobs] Reloader parent detected: not starting background jobs.", flush=True)
+        return
 
-# Setup cleanup on exit
-import atexit
-atexit.register(lambda: scheduler.shutdown() if scheduler else None)
+    _background_started = True
+    print("[jobs] Starting background services...", flush=True)
 
-print("[app] Background services initialized successfully", flush=True)
+    start_polling_if_enabled()
+    _scheduler_instance = start_scheduler()
+
+    if _scheduler_instance:
+        atexit.register(lambda: _scheduler_instance.shutdown() if _scheduler_instance else None)
+
+    print("[jobs] Background services started.", flush=True)
+
+
+# Start jobs at import time (so Azure WSGI also starts them)
+start_background_services_once()
+
 
 # =============================================================================
-# Run Flask
+# Run locally only
 # =============================================================================
 if __name__ == "__main__":
-    # For local development only
     DEBUG = _env_bool("FLASK_DEBUG", _env_bool("DEBUG", True))
-    USE_RELOADER = _env_bool("USE_RELOADER", DEBUG)  # Only use reloader locally
-    
+    USE_RELOADER = _env_bool("USE_RELOADER", DEBUG)
     HOST = _first_env(["FLASK_RUN_HOST"], "0.0.0.0")
     PORT = int(_first_env(["PORT", "FLASK_RUN_PORT"], "5000"))
-    
-    print(f"[app] Starting Flask server in {'DEBUG' if DEBUG else 'PRODUCTION'} mode", flush=True)
+
+    print(f"[app] Starting Flask (debug={DEBUG}, reloader={USE_RELOADER})", flush=True)
     app.run(debug=DEBUG, host=HOST, port=PORT, use_reloader=USE_RELOADER)
