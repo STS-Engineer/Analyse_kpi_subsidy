@@ -161,7 +161,7 @@ DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip(
 # Reminder schedule
 REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "thu").strip().lower()
 REMINDER_HOUR = _env_int("REMINDER_HOUR", 9)
-REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 20)
+REMINDER_MINUTE = _env_int("REMINDER_MINUTE",35)
 REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 
