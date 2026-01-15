@@ -25,7 +25,7 @@ from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-ALWAYS_CC_EMAIL = "sirine.khalfallah@avocarbon.com"
+ALWAYS_CC_EMAIL = "administration.STS@avocarbon.com"
 
 # =============================================================================
 # Env helpers (you said "no .env": we keep env support, but everything has defaults)
@@ -159,8 +159,8 @@ MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multipl
 DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip()
 
 # Reminder schedule
-REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "wed").strip().lower()
-REMINDER_HOUR = _env_int("REMINDER_HOUR", 17)
+REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "thu").strip().lower()
+REMINDER_HOUR = _env_int("REMINDER_HOUR", 9)
 REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 10)
 REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
