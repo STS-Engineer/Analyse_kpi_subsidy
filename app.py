@@ -2,7 +2,6 @@
 import os
 import re
 import json
-import time
 import smtplib
 import atexit
 from email.mime.text import MIMEText
@@ -23,7 +22,6 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
-from apscheduler.triggers.interval import IntervalTrigger
 
 ALWAYS_CC_EMAIL = "administration.STS@avocarbon.com"
 
@@ -144,9 +142,6 @@ DB_TABLE_ACTIONS = _first_env(["DB_TABLE_ACTIONS"], "subsidy_action_plan")
 DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")
 DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")
 
-# Polling interval (seconds) -> used by APScheduler IntervalTrigger
-MONDAY_SYNC_INTERVAL = _env_int("MONDAY_SYNC_INTERVAL", 600)
-
 # ALWAYS filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
 MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "text_mks2y5v7").strip()
 MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"
@@ -157,14 +152,14 @@ DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip(
 
 # Reminder schedule
 REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "fri").strip().lower()
-REMINDER_HOUR = _env_int("REMINDER_HOUR", 14)
-REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 18)
+REMINDER_HOUR = _env_int("REMINDER_HOUR", 10)
+REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 50)
 REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 
 # Background jobs toggles
 ENABLE_BACKGROUND_JOBS = _env_bool("ENABLE_BACKGROUND_JOBS", True)
-ENABLE_POLLING_SYNC = _env_bool("ENABLE_POLLING_SYNC", True)  # now interval job
+ENABLE_POLLING_SYNC = _env_bool("ENABLE_POLLING_SYNC", True)  # we will schedule sync via CronTrigger
 ENABLE_EMAIL_SCHEDULER = _env_bool("ENABLE_EMAIL_SCHEDULER", True)
 
 # Optional: DB advisory lock to avoid duplicates if multiple workers/instances
@@ -642,7 +637,9 @@ def perform_full_sync() -> Dict[str, Any]:
                     else:
                         summary["requests"]["updated"] += 1
 
-                summary["requests"]["deleted"] = delete_missing_by_key(cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, request_ids)
+                summary["requests"]["deleted"] = delete_missing_by_key(
+                    cur, DB_TABLE_REQUESTS, DB_KEY_REQUESTS, request_ids
+                )
 
                 # -------- Actions
                 action_ids: Set[int] = set()
@@ -681,7 +678,9 @@ def perform_full_sync() -> Dict[str, Any]:
                     else:
                         summary["actions"]["updated"] += 1
 
-                summary["actions"]["deleted"] = delete_missing_by_key(cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, action_ids)
+                summary["actions"]["deleted"] = delete_missing_by_key(
+                    cur, DB_TABLE_ACTIONS, DB_KEY_ACTIONS, action_ids
+                )
 
     finally:
         conn.close()
@@ -765,7 +764,10 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
 
     try:
         _smtp_send(server_host, server_port, do_auth=use_auth)
-        print(f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via {server_host}:{server_port} (auth={use_auth})", flush=True)
+        print(
+            f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via {server_host}:{server_port} (auth={use_auth})",
+            flush=True
+        )
         return True
 
     except smtplib.SMTPAuthenticationError as e:
@@ -780,7 +782,10 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             if fb_host and (fb_host != server_host or fb_port != server_port):
                 try:
                     _smtp_send(fb_host, fb_port, do_auth=False)
-                    print(f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via fallback {fb_host}:{fb_port} (auth=False)", flush=True)
+                    print(
+                        f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via fallback {fb_host}:{fb_port} (auth=False)",
+                        flush=True
+                    )
                     return True
                 except Exception as e2:
                     print(f"[email] Fallback send failed via {fb_host}:{fb_port}: {e2}", flush=True)
@@ -902,15 +907,28 @@ def send_late_action_reminders() -> Dict[str, Any]:
 
 
 # =============================================================================
-# Scheduler (AUTO-SYNC + WEEKLY EMAILS inside APScheduler)
+# Scheduled wrappers (lock + logs)
 # =============================================================================
 def _scheduled_sync_job():
-    # Hold DB lock to prevent duplicates (multi-workers)
-    return run_with_db_lock(LOCK_KEY_SYNC, perform_full_sync, "sync")
+    try:
+        print("[auto_sync] Starting sync job...", flush=True)
+        result = run_with_db_lock(LOCK_KEY_SYNC, perform_full_sync, "sync")
+        print(f"[auto_sync] Finished: {result}", flush=True)
+        return result
+    except Exception as e:
+        print(f"[auto_sync] ERROR: {e}", flush=True)
+        raise
 
 
 def _scheduled_reminders_job():
-    return run_with_db_lock(LOCK_KEY_REMINDERS, send_late_action_reminders, "reminders")
+    try:
+        print("[reminders] Starting reminders job...", flush=True)
+        result = run_with_db_lock(LOCK_KEY_REMINDERS, send_late_action_reminders, "reminders")
+        print(f"[reminders] Finished: {result}", flush=True)
+        return result
+    except Exception as e:
+        print(f"[reminders] ERROR: {e}", flush=True)
+        raise
 
 
 # =============================================================================
@@ -1117,8 +1135,7 @@ def get_detailed_data_for_visualization(subsidy_requests: pd.DataFrame, action_p
 @app.route("/")
 def home():
     return jsonify({
-        "message": "Subsidy KPI API + Auto Sync (APScheduler Interval) + Weekly Reminders (Cron)",
-        "sync_interval_seconds": MONDAY_SYNC_INTERVAL,
+        "message": "Subsidy KPI API + Auto Sync (Cron every 15 min) + Weekly Reminders (Cron)",
         "timezone": REMINDER_TIMEZONE,
         "background_jobs": {
             "ENABLE_BACKGROUND_JOBS": ENABLE_BACKGROUND_JOBS,
@@ -1172,7 +1189,6 @@ def scheduler_status():
         "timezone": REMINDER_TIMEZONE,
         "server_utc_now": utc_now().isoformat(),
         "config": {
-            "MONDAY_SYNC_INTERVAL": MONDAY_SYNC_INTERVAL,
             "REMINDER_DAY_OF_WEEK": REMINDER_DAY_OF_WEEK,
             "REMINDER_HOUR": REMINDER_HOUR,
             "REMINDER_MINUTE": REMINDER_MINUTE,
@@ -1313,11 +1329,12 @@ def internal_error(_):
 _background_started = False
 _scheduler_instance: Optional[BackgroundScheduler] = None
 
+
 def start_scheduler():
     """
-    Runs BOTH:
+    Runs BOTH (inside APScheduler):
     - Weekly reminders (Cron)
-    - Auto-sync (Interval) instead of a polling daemon thread
+    - Auto-sync every 15 minutes (Cron: minute="*/15")
     """
     if not ENABLE_EMAIL_SCHEDULER and not ENABLE_POLLING_SYNC:
         print("[scheduler] Disabled (both ENABLE_EMAIL_SCHEDULER and ENABLE_POLLING_SYNC are false)", flush=True)
@@ -1328,15 +1345,15 @@ def start_scheduler():
 
     # Weekly reminders
     if ENABLE_EMAIL_SCHEDULER:
-        trigger = CronTrigger(
+        reminder_trigger = CronTrigger(
             day_of_week=REMINDER_DAY_OF_WEEK,
             hour=REMINDER_HOUR,
             minute=REMINDER_MINUTE,
-            timezone=tz
+            timezone=tz,
         )
         scheduler.add_job(
             func=_scheduled_reminders_job,
-            trigger=trigger,
+            trigger=reminder_trigger,
             id="weekly_late_action_check",
             name="Weekly Late Action Reminder",
             replace_existing=True,
@@ -1344,22 +1361,28 @@ def start_scheduler():
             misfire_grace_time=3600,
             max_instances=1,
         )
-        print(f"[scheduler] Weekly reminder scheduled: {REMINDER_DAY_OF_WEEK} {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({REMINDER_TIMEZONE})", flush=True)
+        print(
+            f"[scheduler] Weekly reminder scheduled: {REMINDER_DAY_OF_WEEK} {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({REMINDER_TIMEZONE})",
+            flush=True
+        )
 
-    # Auto-sync interval
+    # Auto-sync every 15 minutes (00, 15, 30, 45)
     if ENABLE_POLLING_SYNC:
-        interval_seconds = max(int(MONDAY_SYNC_INTERVAL), 10)
+        sync_trigger = CronTrigger(
+            minute="*/15",
+            timezone=tz,
+        )
         scheduler.add_job(
             func=_scheduled_sync_job,
-            trigger=IntervalTrigger(seconds=interval_seconds),
+            trigger=sync_trigger,
             id="auto_sync",
-            name="Auto Sync (Interval)",
+            name="Auto Sync (every 15 min)",
             replace_existing=True,
             coalesce=True,
             misfire_grace_time=3600,
             max_instances=1,
         )
-        print(f"[scheduler] Auto-sync scheduled every {interval_seconds}s", flush=True)
+        print(f"[scheduler] Auto-sync scheduled every 15 minutes ({REMINDER_TIMEZONE})", flush=True)
 
     scheduler.start()
     print("[scheduler] Started", flush=True)
