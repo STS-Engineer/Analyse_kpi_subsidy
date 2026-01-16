@@ -3,13 +3,12 @@ import os
 import re
 import json
 import time
-import threading
 import smtplib
 import atexit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional, Any, Set, Tuple
+from typing import Dict, List, Optional, Any, Set, Tuple, Callable
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -24,11 +23,12 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 ALWAYS_CC_EMAIL = "administration.STS@avocarbon.com"
 
 # =============================================================================
-# Env helpers (you said "no .env": we keep env support, but everything has defaults)
+# Env helpers (no .env, everything has defaults)
 # =============================================================================
 def _first_env(keys: List[str], default: str = "") -> str:
     for k in keys:
@@ -113,10 +113,7 @@ SMTP_INTERNAL_DOMAINS = [
 ]
 
 # monday.com
-MONDAY_API_KEY = _first_env(
-    ["MONDAY_API_KEY"],
-    "eyJhbGciOiJIUzI1NiJ9.eyJ0aWQiOjUzNzU5MzQ0NywiYWFpIjoxMSwidWlkIjo3NjQ5MDYwMiwiaWFkIjoiMjAyNS0wNy0xMFQxNTo0Mzo0OS4wMDBaIiwicGVyIjoibWU6d3JpdGUiLCJhY3RpZCI6NDUyNTc0NywicmduIjoidXNlMSJ9.MhRXxTDVZlx2FSnPii_PZ8dD39Q_kCdZXsrEjOCt4i4",
-)
+MONDAY_API_KEY = _first_env(["MONDAY_API_KEY"], "")
 MONDAY_BOARD_REQUESTS_ID = int(_first_env(["MONDAY_BOARD_REQUESTS_ID"], "9612741617"))
 MONDAY_BOARD_ACTIONS_ID = int(_first_env(["MONDAY_BOARD_ACTIONS_ID"], "9366723818"))
 MONDAY_BASE_URL = _first_env(["MONDAY_BASE_URL"], "https://avocarbon.monday.com")
@@ -126,7 +123,7 @@ MONDAY_ACTION_ITEM_ID_COL_ID = _first_env(["MONDAY_ACTION_ITEM_ID_COL_ID"], "pul
 MONDAY_ACTION_DETAIL_COL_ID = _first_env(["MONDAY_ACTION_DETAIL_COL_ID"], "").strip()
 MONDAY_ACTION_TYPE_COL_ID = "text_mkrva3a0"  # Type of Action -> action_type
 
-# Requests board column IDs (from your board JSON)
+# Requests board column IDs
 REQUEST_DATE_CREATION_COL_ID = "date_mkvttsk8"
 REQUEST_SITE_LOCATION_COL_ID = "dropdown_mksyv6w3"
 REQUEST_TYPE_COL_ID = "color_mkvt418p"
@@ -138,8 +135,8 @@ REQUEST_SUBSIDY_OUTCOME_COL_ID = "color_mkw23bbc"
 REQUEST_AWARDED_PROGRAMS_COL_ID = "text_mkw89xw4"
 REQUEST_AMOUNT_AWARDED_COL_ID = "numeric_mkw2vnds"
 REQUEST_DATE_RECEIPT_COL_ID = "date_mkw383ge"
-REQUEST_ESTIMATED_BUDGET_NUM_COL_ID = "numeric_mkwrdg3z"  # prefer numeric version
-REQUEST_APPLICANT_NAME_COL_ID = "multiple_person_mkt3wpzn"  # people column -> text name
+REQUEST_ESTIMATED_BUDGET_NUM_COL_ID = "numeric_mkwrdg3z"
+REQUEST_APPLICANT_NAME_COL_ID = "multiple_person_mkt3wpzn"
 
 # DB tables / keys
 DB_TABLE_REQUESTS = _first_env(["DB_TABLE_REQUESTS"], "subsidy_requests")
@@ -147,12 +144,12 @@ DB_TABLE_ACTIONS = _first_env(["DB_TABLE_ACTIONS"], "subsidy_action_plan")
 DB_KEY_REQUESTS = _first_env(["DB_KEY_REQUESTS"], "element_id")
 DB_KEY_ACTIONS = _first_env(["DB_KEY_ACTIONS"], "action_id")
 
-# Polling interval (seconds)
-MONDAY_SYNC_INTERVAL = 600
+# Polling interval (seconds) -> used by APScheduler IntervalTrigger
+MONDAY_SYNC_INTERVAL = _env_int("MONDAY_SYNC_INTERVAL", 600)
 
 # ALWAYS filter Actions board to only items where Assistant Generator == "AI Subsidy Assistant"
 MONDAY_ACTIONS_ASSISTANT_COL_ID = _first_env(["MONDAY_ACTIONS_ASSISTANT_COL_ID"], "text_mks2y5v7").strip()
-MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"  # mandatory fixed value
+MONDAY_ACTIONS_ASSISTANT_VALUE = "AI Subsidy Assistant"
 
 # Owner mapping
 MONDAY_ACTION_OWNER_COL_ID = _first_env(["MONDAY_ACTION_OWNER_COL_ID"], "multiple_person_mkv090pp").strip()
@@ -161,20 +158,23 @@ DB_ACTION_OWNER_COL = _first_env(["DB_ACTION_OWNER_COL"], "action_owner").strip(
 # Reminder schedule
 REMINDER_DAY_OF_WEEK = _first_env(["REMINDER_DAY_OF_WEEK"], "fri").strip().lower()
 REMINDER_HOUR = _env_int("REMINDER_HOUR", 10)
-REMINDER_MINUTE = _env_int("REMINDER_MINUTE",50)
+REMINDER_MINUTE = _env_int("REMINDER_MINUTE", 50)
 REMINDER_TIMEZONE = _first_env(["REMINDER_TIMEZONE"], "Africa/Tunis").strip()
 REMINDER_TZINFO = _get_timezone(REMINDER_TIMEZONE)
 
-# Background jobs toggles (handy in Azure)
+# Background jobs toggles
 ENABLE_BACKGROUND_JOBS = _env_bool("ENABLE_BACKGROUND_JOBS", True)
-ENABLE_POLLING_SYNC = _env_bool("ENABLE_POLLING_SYNC", True)
+ENABLE_POLLING_SYNC = _env_bool("ENABLE_POLLING_SYNC", True)  # now interval job
 ENABLE_EMAIL_SCHEDULER = _env_bool("ENABLE_EMAIL_SCHEDULER", True)
 
+# Optional: DB advisory lock to avoid duplicates if multiple workers/instances
+ENABLE_DB_ADVISORY_LOCK = _env_bool("ENABLE_DB_ADVISORY_LOCK", True)
+LOCK_KEY_SYNC = _env_int("LOCK_KEY_SYNC", 10001)
+LOCK_KEY_REMINDERS = _env_int("LOCK_KEY_REMINDERS", 20001)
 
 # =============================================================================
 # Explicit mapping: monday column_id -> DB column name
 # =============================================================================
-# Requests mapping (fills all the DB columns you listed, as long as they exist)
 REQUESTS_COLID_TO_DB: Dict[str, str] = {
     REQUEST_DATE_CREATION_COL_ID: "date_creation",
     REQUEST_SITE_LOCATION_COL_ID: "site_location",
@@ -184,19 +184,17 @@ REQUESTS_COLID_TO_DB: Dict[str, str] = {
     REQUEST_REJECTED_COL_ID: "rejected_subventions",
     REQUEST_ADDITIONAL_NOTES_COL_ID: "additional_notes",
     REQUEST_SUBSIDY_OUTCOME_COL_ID: "subsidy_outcome",
-    REQUEST_AWARDED_PROGRAMS_COL_ID: "Names of Awarded Subvention Programs",  # keeps your DB name even if it has spaces
+    REQUEST_AWARDED_PROGRAMS_COL_ID: "Names of Awarded Subvention Programs",
     REQUEST_AMOUNT_AWARDED_COL_ID: "amount_awarded",
     REQUEST_DATE_RECEIPT_COL_ID: "date_of_subsidy_receipt",
     REQUEST_ESTIMATED_BUDGET_NUM_COL_ID: "estimated_budget",
     REQUEST_APPLICANT_NAME_COL_ID: "applicant_name",
 }
 
-# Actions mapping
 ACTIONS_COLID_TO_DB: Dict[str, str] = {
     MONDAY_ACTION_TYPE_COL_ID: "action_type",
-    MONDAY_ACTIONS_ASSISTANT_COL_ID: "assistant_generator",  # if this column exists in DB
+    MONDAY_ACTIONS_ASSISTANT_COL_ID: "assistant_generator",
 }
-
 
 # =============================================================================
 # Helpers
@@ -251,6 +249,45 @@ def get_table_columns(conn, table: str) -> Set[str]:
     with conn.cursor() as cur:
         cur.execute(q, (table,))
         return {r[0] for r in cur.fetchall()}
+
+
+# =============================================================================
+# Advisory lock helpers (prevents duplicates with multi-workers)
+# =============================================================================
+def _try_advisory_lock(conn, lock_key: int) -> bool:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (lock_key,))
+        row = cur.fetchone()
+        return bool(row and row[0])
+
+
+def _unlock_advisory_lock(conn, lock_key: int) -> None:
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (lock_key,))
+
+
+def run_with_db_lock(lock_key: int, fn: Callable[[], Any], label: str) -> Any:
+    """
+    Holds an advisory lock for the duration of fn().
+    Uses a dedicated DB connection to hold the lock.
+    """
+    if not ENABLE_DB_ADVISORY_LOCK:
+        return fn()
+
+    conn = get_db_connection()
+    try:
+        if not _try_advisory_lock(conn, lock_key):
+            print(f"[lock:{label}] Skipped (lock already held)", flush=True)
+            return {"skipped": True, "reason": "lock_held", "label": label, "ts": utc_now().isoformat()}
+        try:
+            return fn()
+        finally:
+            try:
+                _unlock_advisory_lock(conn, lock_key)
+            except Exception:
+                pass
+    finally:
+        conn.close()
 
 
 # =============================================================================
@@ -372,7 +409,7 @@ def fetch_user_emails(api_key: str, user_ids: List[int]) -> Dict[int, str]:
 
 
 # =============================================================================
-# Mapping monday -> DB row (supports explicit col_id mapping + fallback)
+# Mapping monday -> DB row
 # =============================================================================
 def map_item_to_db_values(
     item: Dict[str, Any],
@@ -385,38 +422,34 @@ def map_item_to_db_values(
 ) -> Dict[str, Any]:
     values: Dict[str, Any] = {}
 
-    # External key (element_id/action_id)
     if key_col in db_columns:
         values[key_col] = monday_item_id
 
-    # Name
     if "name" in db_columns:
         values["name"] = item.get("name", "")
 
-    # Updated timestamp (if you have it)
     if "updated_at" in db_columns:
         values["updated_at"] = utc_now()
 
-    # Map columns
     for cv in item.get("column_values", []) or []:
         col_id = cv.get("id")
         text_val = normalize_value(cv.get("text"))
 
-        # 1) explicit mapping by monday col_id
+        # 1) explicit mapping
         if colid_to_db and col_id in colid_to_db:
             db_col = colid_to_db[col_id]
             if db_col in db_columns and text_val is not None:
                 values[db_col] = text_val
             continue
 
-        # 2) fallback mapping by title -> sanitized db_guess
+        # 2) fallback mapping by title
         col = cv.get("column") or {}
         title = col.get("title") or ""
         db_guess = sanitize_column_name(title)
         if db_guess in db_columns and text_val is not None:
             values[db_guess] = text_val
 
-    # Special: action_detail (keep your existing logic)
+    # Special: action_detail
     if is_actions_table and "action_detail" in db_columns:
         if MONDAY_ACTION_DETAIL_COL_ID:
             for cv in item.get("column_values", []) or []:
@@ -442,7 +475,7 @@ def map_item_to_db_values(
                         values["action_detail"] = v
                     break
 
-    # Special: item_link (clickable monday URL)
+    # Special: item_link
     if is_actions_table and "item_link" in db_columns:
         item_id_str: str = ""
         for cv in item.get("column_values", []) or []:
@@ -456,7 +489,7 @@ def map_item_to_db_values(
 
 
 # =============================================================================
-# DB upsert/delete (SAFE identifiers even if column names have spaces)
+# DB upsert/delete
 # =============================================================================
 def exists_by_key(cur, table: str, key_col: str, key_val: int) -> bool:
     q = sql.SQL("SELECT 1 FROM {} WHERE {} = %s").format(
@@ -496,7 +529,6 @@ def upsert_by_key(cur, table: str, key_col: str, values: Dict[str, Any], *, db_c
 
     key_val = int(values[key_col])
 
-    # created_at only on insert if column exists and not provided
     if not exists_by_key(cur, table, key_col, key_val):
         if "created_at" in db_columns and "created_at" not in values:
             values["created_at"] = utc_now()
@@ -571,6 +603,7 @@ def perform_full_sync() -> Dict[str, Any]:
     summary = {
         "requests": {"inserted": 0, "updated": 0, "deleted": 0, "count_monday": len(requests_items)},
         "actions": {"inserted": 0, "updated": 0, "deleted": 0, "count_monday": len(actions_items)},
+        "timestamp": utc_now().isoformat(),
     }
 
     conn = get_db_connection()
@@ -657,44 +690,13 @@ def perform_full_sync() -> Dict[str, Any]:
 
 
 # =============================================================================
-# POLLING THREAD
-# =============================================================================
-def _sync_loop():
-    while True:
-        try:
-            s = perform_full_sync()
-            print("[sync_thread] Sync OK:", s, flush=True)
-        except Exception as e:
-            print(f"[sync_thread] Error during sync: {e}", flush=True)
-
-        time.sleep(max(MONDAY_SYNC_INTERVAL, 10))
-
-
-def start_polling_if_enabled():
-    if not ENABLE_POLLING_SYNC:
-        print("[sync_thread] Polling disabled (ENABLE_POLLING_SYNC=false)", flush=True)
-        return
-
-    if MONDAY_SYNC_INTERVAL > 0:
-        t = threading.Thread(target=_sync_loop, daemon=True)
-        t.start()
-        print(f"[sync_thread] Polling enabled every {MONDAY_SYNC_INTERVAL}s", flush=True)
-    else:
-        print("[sync_thread] Polling not started: MONDAY_SYNC_INTERVAL <= 0", flush=True)
-
-
-# =============================================================================
 # EMAIL FUNCTIONS
 # =============================================================================
 def send_email(to_email: str, subject: str, body_html: str) -> bool:
     """
     Send an email using the configured SMTP settings.
-
     Always adds administrationSTS in CC on every email.
     """
-
-    ALWAYS_CC_EMAIL = "administration.STS@avocarbon.com"
-
     def _email_domain(addr: str) -> str:
         addr = (addr or "").strip().lower()
         if "@" not in addr:
@@ -706,7 +708,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             return True
         return _email_domain(addr) in set(SMTP_INTERNAL_DOMAINS)
 
-    # Decide auth usage
     server_host = (SMTP_SERVER or "").strip()
     server_port = int(SMTP_PORT)
 
@@ -722,13 +723,10 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
     elif auth_mode in {"login", "auth", "true", "1"}:
         use_auth = True
     else:
-        # auto
         use_auth = bool(EMAIL_PASSWORD)
-        # Office 365 MX endpoints typically do not support AUTH
         if server_port == 25 and looks_like_o365_mx:
             use_auth = False
 
-    # Build message
     msg = MIMEMultipart("alternative")
     msg["From"] = EMAIL_USER or ""
     msg["To"] = to_email
@@ -736,7 +734,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
     msg["Subject"] = subject
     msg.attach(MIMEText(body_html, "html"))
 
-    # Recipients list must contain TO + CC (IMPORTANT)
     recipients = [to_email]
     if ALWAYS_CC_EMAIL:
         recipients.append(ALWAYS_CC_EMAIL)
@@ -746,7 +743,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
             raise RuntimeError("SMTP host is empty")
 
         if not do_auth:
-            # Safety: prevent unauthenticated external sends by default
             for r in recipients:
                 if not _is_internal_recipient(r):
                     raise RuntimeError(
@@ -755,8 +751,6 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
 
         with smtplib.SMTP(host, port, timeout=30) as server:
             server.ehlo()
-
-            # STARTTLS: required on 587; optional elsewhere if offered.
             want_starttls = (port == 587) or _env_bool("SMTP_USE_STARTTLS", True)
             if want_starttls and server.has_extn("starttls"):
                 server.starttls()
@@ -767,36 +761,26 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
                     raise RuntimeError("EMAIL_USER / EMAIL_PASSWORD not set for SMTP AUTH")
                 server.login(EMAIL_USER, EMAIL_PASSWORD)
 
-            # ✅ This is the complete replacement for server.send_message(msg)
             server.sendmail(msg["From"], recipients, msg.as_string())
 
-    # 1) Try primary server
     try:
         _smtp_send(server_host, server_port, do_auth=use_auth)
-        print(
-            f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via {server_host}:{server_port} (auth={use_auth})",
-            flush=True
-        )
+        print(f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via {server_host}:{server_port} (auth={use_auth})", flush=True)
         return True
 
     except smtplib.SMTPAuthenticationError as e:
         err = str(e)
         print(f"[email] SMTP AUTH failed via {server_host}:{server_port}: {err}", flush=True)
 
-        # If basic auth is disabled, retry with configured fallback (no-auth)
         basic_auth_disabled = ("5.7.139" in err) or ("basic authentication is disabled" in err.lower())
 
         if SMTP_ALLOW_NO_AUTH_FALLBACK and basic_auth_disabled:
             fb_host = (SMTP_FALLBACK_SERVER or "").strip()
             fb_port = int(SMTP_FALLBACK_PORT)
-
             if fb_host and (fb_host != server_host or fb_port != server_port):
                 try:
                     _smtp_send(fb_host, fb_port, do_auth=False)
-                    print(
-                        f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via fallback {fb_host}:{fb_port} (auth=False)",
-                        flush=True
-                    )
+                    print(f"[email] Sent to {to_email} (cc={ALWAYS_CC_EMAIL}) via fallback {fb_host}:{fb_port} (auth=False)", flush=True)
                     return True
                 except Exception as e2:
                     print(f"[email] Fallback send failed via {fb_host}:{fb_port}: {e2}", flush=True)
@@ -806,6 +790,7 @@ def send_email(to_email: str, subject: str, body_html: str) -> bool:
     except Exception as e:
         print(f"[email] Failed to send to {to_email} via {server_host}:{server_port}: {e}", flush=True)
         return False
+
 
 def get_late_actions() -> List[Dict[str, Any]]:
     conn = get_db_connection()
@@ -917,36 +902,15 @@ def send_late_action_reminders() -> Dict[str, Any]:
 
 
 # =============================================================================
-# Scheduler
+# Scheduler (AUTO-SYNC + WEEKLY EMAILS inside APScheduler)
 # =============================================================================
-def start_scheduler():
-    if not ENABLE_EMAIL_SCHEDULER:
-        print("[scheduler] Disabled (ENABLE_EMAIL_SCHEDULER=false)", flush=True)
-        return None
+def _scheduled_sync_job():
+    # Hold DB lock to prevent duplicates (multi-workers)
+    return run_with_db_lock(LOCK_KEY_SYNC, perform_full_sync, "sync")
 
-    tz = REMINDER_TZINFO
-    scheduler = BackgroundScheduler(timezone=tz) if tz else BackgroundScheduler()
 
-    trigger = CronTrigger(
-        day_of_week=REMINDER_DAY_OF_WEEK,
-        hour=REMINDER_HOUR,
-        minute=REMINDER_MINUTE,
-        timezone=tz
-    )
-
-    scheduler.add_job(
-        func=send_late_action_reminders,
-        trigger=trigger,
-        id="weekly_late_action_check",
-        name="Weekly Late Action Reminder",
-        replace_existing=True,
-        coalesce=True,
-        misfire_grace_time=3600,
-    )
-
-    scheduler.start()
-    print(f"[scheduler] Weekly reminder scheduled: {REMINDER_DAY_OF_WEEK} {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({REMINDER_TIMEZONE})", flush=True)
-    return scheduler
+def _scheduled_reminders_job():
+    return run_with_db_lock(LOCK_KEY_REMINDERS, send_late_action_reminders, "reminders")
 
 
 # =============================================================================
@@ -1153,12 +1117,14 @@ def get_detailed_data_for_visualization(subsidy_requests: pd.DataFrame, action_p
 @app.route("/")
 def home():
     return jsonify({
-        "message": "Subsidy KPI API + Polling Sync + Weekly Reminders",
-        "polling_interval_seconds": MONDAY_SYNC_INTERVAL,
+        "message": "Subsidy KPI API + Auto Sync (APScheduler Interval) + Weekly Reminders (Cron)",
+        "sync_interval_seconds": MONDAY_SYNC_INTERVAL,
+        "timezone": REMINDER_TIMEZONE,
         "background_jobs": {
             "ENABLE_BACKGROUND_JOBS": ENABLE_BACKGROUND_JOBS,
             "ENABLE_POLLING_SYNC": ENABLE_POLLING_SYNC,
             "ENABLE_EMAIL_SCHEDULER": ENABLE_EMAIL_SCHEDULER,
+            "ENABLE_DB_ADVISORY_LOCK": ENABLE_DB_ADVISORY_LOCK,
         }
     })
 
@@ -1184,6 +1150,39 @@ def trigger_reminders():
         return jsonify(result), 200
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/scheduler-status", methods=["GET"])
+def scheduler_status():
+    global _scheduler_instance
+    if not _scheduler_instance:
+        return jsonify({"running": False, "reason": "no_scheduler_instance"}), 200
+
+    jobs = []
+    for j in _scheduler_instance.get_jobs():
+        jobs.append({
+            "id": j.id,
+            "name": j.name,
+            "trigger": str(j.trigger),
+            "next_run_time": j.next_run_time.isoformat() if j.next_run_time else None,
+        })
+
+    return jsonify({
+        "running": bool(_scheduler_instance.running),
+        "timezone": REMINDER_TIMEZONE,
+        "server_utc_now": utc_now().isoformat(),
+        "config": {
+            "MONDAY_SYNC_INTERVAL": MONDAY_SYNC_INTERVAL,
+            "REMINDER_DAY_OF_WEEK": REMINDER_DAY_OF_WEEK,
+            "REMINDER_HOUR": REMINDER_HOUR,
+            "REMINDER_MINUTE": REMINDER_MINUTE,
+            "ENABLE_BACKGROUND_JOBS": ENABLE_BACKGROUND_JOBS,
+            "ENABLE_POLLING_SYNC": ENABLE_POLLING_SYNC,
+            "ENABLE_EMAIL_SCHEDULER": ENABLE_EMAIL_SCHEDULER,
+            "ENABLE_DB_ADVISORY_LOCK": ENABLE_DB_ADVISORY_LOCK,
+        },
+        "jobs": jobs,
+    }), 200
 
 
 @app.route("/api/kpis/global", methods=["GET"])
@@ -1312,7 +1311,60 @@ def internal_error(_):
 # Background jobs bootstrap (WSGI/Azure compatible)
 # =============================================================================
 _background_started = False
-_scheduler_instance = None
+_scheduler_instance: Optional[BackgroundScheduler] = None
+
+def start_scheduler():
+    """
+    Runs BOTH:
+    - Weekly reminders (Cron)
+    - Auto-sync (Interval) instead of a polling daemon thread
+    """
+    if not ENABLE_EMAIL_SCHEDULER and not ENABLE_POLLING_SYNC:
+        print("[scheduler] Disabled (both ENABLE_EMAIL_SCHEDULER and ENABLE_POLLING_SYNC are false)", flush=True)
+        return None
+
+    tz = REMINDER_TZINFO
+    scheduler = BackgroundScheduler(timezone=tz) if tz else BackgroundScheduler()
+
+    # Weekly reminders
+    if ENABLE_EMAIL_SCHEDULER:
+        trigger = CronTrigger(
+            day_of_week=REMINDER_DAY_OF_WEEK,
+            hour=REMINDER_HOUR,
+            minute=REMINDER_MINUTE,
+            timezone=tz
+        )
+        scheduler.add_job(
+            func=_scheduled_reminders_job,
+            trigger=trigger,
+            id="weekly_late_action_check",
+            name="Weekly Late Action Reminder",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=3600,
+            max_instances=1,
+        )
+        print(f"[scheduler] Weekly reminder scheduled: {REMINDER_DAY_OF_WEEK} {REMINDER_HOUR:02d}:{REMINDER_MINUTE:02d} ({REMINDER_TIMEZONE})", flush=True)
+
+    # Auto-sync interval
+    if ENABLE_POLLING_SYNC:
+        interval_seconds = max(int(MONDAY_SYNC_INTERVAL), 10)
+        scheduler.add_job(
+            func=_scheduled_sync_job,
+            trigger=IntervalTrigger(seconds=interval_seconds),
+            id="auto_sync",
+            name="Auto Sync (Interval)",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=3600,
+            max_instances=1,
+        )
+        print(f"[scheduler] Auto-sync scheduled every {interval_seconds}s", flush=True)
+
+    scheduler.start()
+    print("[scheduler] Started", flush=True)
+    return scheduler
+
 
 def start_background_services_once():
     global _background_started, _scheduler_instance
@@ -1323,7 +1375,7 @@ def start_background_services_once():
     if _background_started:
         return
 
-    # Local debug reloader guard (prevents double start in dev)
+    # Local debug reloader guard
     if _env_bool("USE_RELOADER", False) and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
         print("[jobs] Reloader parent detected: not starting background jobs.", flush=True)
         return
@@ -1331,16 +1383,14 @@ def start_background_services_once():
     _background_started = True
     print("[jobs] Starting background services...", flush=True)
 
-    start_polling_if_enabled()
     _scheduler_instance = start_scheduler()
-
     if _scheduler_instance:
         atexit.register(lambda: _scheduler_instance.shutdown() if _scheduler_instance else None)
 
     print("[jobs] Background services started.", flush=True)
 
 
-# Start jobs at import time (so Azure WSGI also starts them)
+# Start jobs at import time (Azure WSGI will import this module)
 start_background_services_once()
 
 
